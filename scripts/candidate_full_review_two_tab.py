@@ -119,19 +119,26 @@ PHASE4_EXTRA_HEADERS = [
     "Phase4 Core/Addon Disagreement", "Phase4 Check4 Early WR %", "Phase4 Check4 Late WR %",
 ]
 
-# item #3 (2026-09-02): 1-minute-resolution CAGR siblings of Cagr/Cagr Add on/CAGR
-# Drought/CAGR Both, for direct comparison against the primary 1s-resolution numbers
-# (the two can diverge hugely -- confirmed real case, ETHU node 19460: core_both_cagr_1m
-# =531.9% vs. core_both_cagr_1s=114.8%). Placed right after CURATED_HEADERS' 24 columns,
+# item #3 (2026-09-02, revised 2026-09-07): 1s is now the canonical/headline resolution
+# for EVERY metric (addon/drought/both, via the mislabeling fix above) -- the ONLY
+# remaining 1-minute comparison column is Cagr (1m), the core-CAGR sibling, since that's
+# the one place a direct 1m-vs-1s comparison is still wanted (confirmed real divergence
+# case, ETHU node 19460: core_cagr_1m vs core_cagr_1s). Peer/user-confirmed 2026-09-07:
+# spliced directly into the curated header block right after "Cagr" (column H) instead
+# of appended after all 24 CURATED_HEADERS columns, so the comparison sits next to the
+# number it's comparing against rather than buried at the end of the row.
+#
 # LOCAL to this file rather than added to the shared build_v6_promotion_combined_report.
 # CURATED_HEADERS/MANUAL_BLANK_COLS constants -- that module's own write_combined_xlsx
 # independently builds a 24-element `curated` row list keyed to CURATED_HEADERS' current
 # length; growing the shared constant would silently misalign ITS output columns (the
 # 144-col checklist block would land 4 columns early) without touching its own code.
-# TWO_TAB_MANUAL_BLANK_COLS (2, down from the shared MANUAL_BLANK_COLS' 6) keeps this
-# file's own total column count unchanged by the reshuffle (24 + 4 + 2 = 24 + 6 = 30).
-TWO_TAB_1M_HEADERS = ["Cagr (1m)", "Cagr Add on (1m)", "CAGR Drought (1m)", "CAGR Both (1m)"]
-TWO_TAB_MANUAL_BLANK_COLS = 2  # was "U-Z"/6 (shared MANUAL_BLANK_COLS) before item #3; now Y-Z/2
+_CAGR_IDX = CURATED_HEADERS.index("Cagr")  # 7 (0-indexed) -- column H
+TWO_TAB_CURATED_HEADERS = CURATED_HEADERS[:_CAGR_IDX + 1] + ["Cagr (1m)"] + CURATED_HEADERS[_CAGR_IDX + 1:]
+# TWO_TAB_MANUAL_BLANK_COLS (5): keeps this file's own total front-block width unchanged
+# by the reshuffle -- 24(CURATED_HEADERS) + 1(spliced Cagr (1m)) + 5 = 30 = 24 + 6 (the
+# shared MANUAL_BLANK_COLS this file originally matched before item #3 first shrank it).
+TWO_TAB_MANUAL_BLANK_COLS = 5
 
 # User's own standing manual-review highlight set (2026-09-04, confirmed against real
 # column letters BD/BE/BO/BT/BU/BZ/CC/CD/DI in a live report) -- see _write_curated_tab's
@@ -209,12 +216,18 @@ def _is_number_header(header):
             or h.endswith("_count") or h.startswith("n_trades"))
 
 # User's front-block visibility convention (2026-09-04, confirmed against real column
-# letters A-AD): 1-indexed positions within CURATED_HEADERS+TWO_TAB_1M_HEADERS+
+# letters A-AD): 1-indexed positions within TWO_TAB_CURATED_HEADERS+
 # TWO_TAB_MANUAL_BLANK_COLS (30 columns, A:AD) to group/hide -- everything else in
 # that range stays visible. Positional (not name-keyed) since 2 of the 30 are blank
 # manual columns with no header text to key on -- relies on the user's own stated
 # "assuming it doesn't change order" caveat, same as the rest of this block.
-FRONT_BLOCK_HIDDEN_POSITIONS = [4, 5, 6, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21]
+#
+# Shifted +1 for every original position >= 9 (2026-09-07, Cagr (1m) splice): the
+# original convention was keyed to CURATED_HEADERS+TWO_TAB_1M_HEADERS (1m columns
+# appended after all 24), e.g. position 9 = "Worst Neighbor". Cagr (1m) now sits AT
+# position 9 (spliced right after Cagr at position 8), pushing Worst Neighbor and
+# everything after it to position+1 -- same semantic columns hidden, new positions.
+FRONT_BLOCK_HIDDEN_POSITIONS = [4, 5, 6, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22]
 
 
 def _phase4_extra_by_id(conn, node_ids):
@@ -275,12 +288,23 @@ def _watch_list_semantic_axes(strategy, take_profit, stop_loss, trail_buy_pct, t
     -- confirmed unused/irrelevant for this strategy's real semantic mapping.
 
     Any other strategy (TrailingExitZScoreBreakout, the only other real strategy in this
-    codebase): watch_list's own take_profit/stop_loss/trail_sell_pct columns are already
-    the direct semantic values (confirmed: watch_list.stop_loss == watch_list.trail_sell_
-    pct in every real sample, both feed the same sl_axis_col='trail_pct' slot)."""
+    codebase): v6 fix (2026-09-07, real bug found + confirmed against live data -- the
+    prior claim here, 'watch_list.stop_loss == watch_list.trail_sell_pct in every real
+    sample', is FALSE for every one of the 5 real live TrailingExit rows (AGQ id=239:
+    stop_loss=2/trail_sell_pct=11, GDXU id=240: 1/16, UGL id=246: 2/5, DPST id=248: 1/13,
+    SOXL id=249: 5/8) -- this caused _promoted_node_ids to feed watch_list.stop_loss into
+    params['trail_pct'] (sl_axis_col='trail_pct' for TrailingExit, fourth_axis=None so
+    trail_sell_pct was never actually consulted at all), producing a params_json that
+    never matched the real candidate_nodes row. Confirmed the correct feed is trail_sell_
+    pct directly: AGQ/DPST/UGL/SOXL all produce a byte-identical params_json match against
+    their real live candidate_nodes row (36009/37841/47266/46551) once trail_sell_pct is
+    used instead of stop_loss; watch_list.stop_loss is NOT used at all for TrailingExit,
+    same as Both -- confirmed unused/irrelevant for this strategy's real semantic mapping
+    too (GDXU still returns no match under either mapping -- separately confirmed genuinely
+    absent from the v6.5.1 pool, not this bug, see docs/session_cache.md 2026-09-0x entry)."""
     if strategy == "TrailingBothZScoreBreakout":
         return arm_sell_pct, trail_buy_pct, trail_sell_pct
-    return take_profit, stop_loss, trail_sell_pct
+    return take_profit, trail_sell_pct, trail_sell_pct
 
 
 def _promoted_node_ids(conn, version, tickers, live_db_path=LIVE_DB_PATH):
@@ -457,10 +481,16 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
             fr["trades"], fr["years"], fr["status"],
             fr["addon_compounded_pct"], fr["addon_n"], fr["addon_tranche"], fr["addon_wr_tranche"],
             fr["drought_compounded_pct"], fr["drought_n"], fr["drought_tranche"], fr["drought_wr_verdict"],
-            fr["core_addon_cagr_pct"], fr["core_drought_cagr_pct"], fr["core_both_cagr_pct"],
+            # 2026-09-07 mislabeling fix (node 43258): these 3 now come from Phase5's
+            # proven-correct addon_cagr_1s/drought_cagr_1s/core_both_cagr_1s (see
+            # _enrich_full_review_core_cagr's own docstring), NOT Phase4's own
+            # core_addon_cagr_pct/core_drought_cagr_pct/core_both_cagr_pct, which this
+            # branch used to source silently -- same proven kernel, but the OLD values
+            # were stale relative to what Phase5 already re-verified.
+            _pct100(fr.get("addon_cagr_1s")), _pct100(fr.get("drought_cagr_1s")),
+            _pct100(fr.get("core_both_cagr_1s")),
         ]
-        front_1m = [_pct100(fr.get("core_cagr_1m")), _pct100(fr.get("addon_cagr_1m")),
-                    _pct100(fr.get("drought_cagr_1m")), _pct100(fr.get("core_both_cagr_1m"))]
+        front_1m = [_pct100(fr.get("core_cagr_1m"))]
         checklist = [fr.get(h) for h in FIELDNAMES]
         return front, front_1m, checklist, p4
 
@@ -480,8 +510,7 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
         p4[1], None, None, None,
         _pct100(r.get("addon_cagr_1s")), _pct100(r.get("drought_cagr_1s")), _pct100(r.get("core_both_cagr_1s")),
     ]
-    front_1m = [_pct100(r.get("core_cagr_1m")), _pct100(r.get("addon_cagr_1m")),
-                _pct100(r.get("drought_cagr_1m")), _pct100(r.get("core_both_cagr_1m"))]
+    front_1m = [_pct100(r.get("core_cagr_1m"))]
     # Identity/classification fields (v7, 2026-09-04): cheap ticker/version-level lookups
     # that don't require the expensive full-checklist compute -- were previously zeroed
     # out unconditionally along with the genuinely-expensive trade-resimulation columns
@@ -514,20 +543,19 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
 def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
                         lightweight_by_id, winner_by_id, phase4_extra_by_id,
                         version=None, sector_fn=None, underlier_fn=None):
-    """Writes one CURATED_HEADERS(24) + TWO_TAB_1M_HEADERS(4) + TWO_TAB_MANUAL_BLANK_COLS(2)
-    + FIELDNAMES(144) + PHASE4_EXTRA_HEADERS(10) = 184-column tab for the given `node_ids`
-    in order -- shared by all 4 tabs, see _curated_front_and_checklist's own docstring for
-    the per-row data-sourcing rule. The phase4 block (item #2, 2026-09-02) is appended
-    after the existing 174 columns rather than overloaded onto any of them, and is
-    populated uniformly (whichever branch -- Full Review match or lightweight fallback --
-    supplied the rest of the row) since phase4_results covers the whole core_safe
-    population, not just raw-only rows. The 1m block (item #3, same day) sits right after
-    CURATED_HEADERS, consuming 4 of the original 6 manual-blank columns -- see
-    TWO_TAB_1M_HEADERS' own module-level comment for why it's local to this file."""
+    """Writes one TWO_TAB_CURATED_HEADERS(25, CURATED_HEADERS(24) with Cagr (1m) spliced
+    in after Cagr) + TWO_TAB_MANUAL_BLANK_COLS(5) + FIELDNAMES(144) + PHASE4_EXTRA_HEADERS
+    (10) = 184-column tab for the given `node_ids` in order -- shared by all 4 tabs, see
+    _curated_front_and_checklist's own docstring for the per-row data-sourcing rule. The
+    phase4 block (item #2, 2026-09-02) is appended after the existing 174 columns rather
+    than overloaded onto any of them, and is populated uniformly (whichever branch --
+    Full Review match or lightweight fallback -- supplied the rest of the row) since
+    phase4_results covers the whole core_safe population, not just raw-only rows. See
+    TWO_TAB_CURATED_HEADERS' own module-level comment for the Cagr (1m) splice."""
     from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
 
-    headers = (CURATED_HEADERS + TWO_TAB_1M_HEADERS + [None] * TWO_TAB_MANUAL_BLANK_COLS
+    headers = (TWO_TAB_CURATED_HEADERS + [None] * TWO_TAB_MANUAL_BLANK_COLS
                + list(FIELDNAMES) + PHASE4_EXTRA_HEADERS)
     ws.append(headers)
     for cell in ws[1]:
@@ -539,8 +567,11 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
             node_id, promoted_ids, k1_fn, counter, full_review_by_id,
             lightweight_by_id.get(node_id), winner_by_id.get(node_id), phase4_extra_by_id,
             version=version, sector_fn=sector_fn, underlier_fn=underlier_fn)
-        ws.append(front + front_1m + [None] * TWO_TAB_MANUAL_BLANK_COLS + checklist + phase4_extra)
-    for i, h in enumerate(CURATED_HEADERS, start=1):
+        # Cagr (1m) spliced into `front` at the same point as TWO_TAB_CURATED_HEADERS
+        # (right after Cagr, index _CAGR_IDX) -- front_1m is a single-element list now.
+        row_front = front[:_CAGR_IDX + 1] + front_1m + front[_CAGR_IDX + 1:]
+        ws.append(row_front + [None] * TWO_TAB_MANUAL_BLANK_COLS + checklist + phase4_extra)
+    for i, h in enumerate(TWO_TAB_CURATED_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(h) + 2, 30))
     ws.freeze_panes = "B2"
 
@@ -569,7 +600,7 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
     # collapse those. Keyed off USER_HIGHLIGHTED_FIELDNAMES (names, not letters) so
     # this stays correct if FIELDNAMES' own order/length ever shifts -- only breaks
     # if one of these exact names is renamed or removed from COLUMN_DEFS entirely.
-    fieldnames_start_col = len(CURATED_HEADERS) + len(TWO_TAB_1M_HEADERS) + TWO_TAB_MANUAL_BLANK_COLS + 1
+    fieldnames_start_col = len(TWO_TAB_CURATED_HEADERS) + TWO_TAB_MANUAL_BLANK_COLS + 1
     highlighted_cols = sorted(fieldnames_start_col + FIELDNAMES.index(name) for name in USER_HIGHLIGHTED_FIELDNAMES)
     for col in range(fieldnames_start_col, highlighted_cols[-1] + 1):
         if col not in highlighted_cols:
@@ -621,26 +652,39 @@ def _enrich_full_review_core_cagr(conn, csv_rows):
     deviation #1) -- core_cagr_1s is the real per-candidate CAGR that DOES exist for this
     data source, and is what _curate_combined_rows below uses for its Best-Both ranking
     and what the Combined tab's 'Cagr' column shows, per the standing project convention
-    of CAGR over robust_alpha for reporting/ranking (feedback_cagr_over_robust_alpha)."""
+    of CAGR over robust_alpha for reporting/ranking (feedback_cagr_over_robust_alpha).
+
+    addon_cagr_1s/drought_cagr_1s/core_both_cagr_1s (2026-09-07, real mislabeling bug fix
+    -- confirmed live, node 43258): _curated_front_and_checklist's Full-Review-match
+    branch was sourcing its 'Cagr Add on'/'CAGR Drought'/'CAGR Both' columns from Phase4's
+    OWN core_addon_cagr_pct/core_drought_cagr_pct/core_both_cagr_pct fields instead of
+    these proven-correct Phase5 1s values -- Phase5's overlay_cagrs() calls the same
+    underlying kernel functions Phase4 does, so these ARE the canonical numbers, not a
+    second opinion. Pulled here (not recomputed) since no new compute is needed."""
     ids = [r["node_id"] for r in csv_rows if r.get("node_id") is not None]
     cagr_map = {}
     cagr_1m_map = {}
+    cagr_1s_overlay_map = {}
     if ids:
         placeholders = ",".join("?" * len(ids))
         cagr_map = dict(conn.execute(
             f"SELECT candidate_id, core_cagr_1s FROM candidate_verification_results "
             f"WHERE candidate_id IN ({placeholders})", ids))
-        # item #3 (2026-09-02): the 1-minute-resolution siblings, never previously carried
-        # onto the Full-Review-match branch (only core_cagr_1s was pulled here) -- these
-        # ARE raw fractions straight from candidate_verification_results, same as
-        # core_cagr_1s, so the front-row build below still needs _pct100() on them.
-        cagr_1m_map = {row[0]: row[1:] for row in conn.execute(
-            f"SELECT candidate_id, core_cagr_1m, addon_cagr_1m, drought_cagr_1m, core_both_cagr_1m "
+        # item #3 (2026-09-02): the 1-minute-resolution sibling of core Cagr only (2026-09-07:
+        # addon/drought/both no longer carry a 1m sibling in this report at all) -- a raw
+        # fraction straight from candidate_verification_results, same as core_cagr_1s, so
+        # the front-row build below still needs _pct100() on it.
+        cagr_1m_map = dict(conn.execute(
+            f"SELECT candidate_id, core_cagr_1m FROM candidate_verification_results "
+            f"WHERE candidate_id IN ({placeholders})", ids))
+        cagr_1s_overlay_map = {row[0]: row[1:] for row in conn.execute(
+            f"SELECT candidate_id, addon_cagr_1s, drought_cagr_1s, core_both_cagr_1s "
             f"FROM candidate_verification_results WHERE candidate_id IN ({placeholders})", ids)}
     for r in csv_rows:
         r["core_cagr_1s"] = cagr_map.get(r.get("node_id"))
-        m1 = cagr_1m_map.get(r.get("node_id")) or (None, None, None, None)
-        r["core_cagr_1m"], r["addon_cagr_1m"], r["drought_cagr_1m"], r["core_both_cagr_1m"] = m1
+        r["core_cagr_1m"] = cagr_1m_map.get(r.get("node_id"))
+        m1s = cagr_1s_overlay_map.get(r.get("node_id")) or (None, None, None)
+        r["addon_cagr_1s"], r["drought_cagr_1s"], r["core_both_cagr_1s"] = m1s
     return csv_rows
 
 
@@ -694,22 +738,30 @@ def _curate_combined_rows(csv_rows):
     for ticker, rows in by_ticker.items():
         safe = [r for r in rows if r.get("status") == "SAFE"]
 
+        # addon_cagr_1s/drought_cagr_1s (2026-09-07, ranking-vs-display consistency fix):
+        # switched from Phase4's own core_addon_cagr_pct/core_drought_cagr_pct to match
+        # the same mislabeling fix applied to _curated_front_and_checklist's DISPLAYED
+        # Cagr Add on/CAGR Drought columns (Phase5's proven-correct 1s values) -- keeping
+        # the OLD metric here after that fix would have re-created exactly the ranking-
+        # vs-displayed-metric mismatch the v5 fix (see this function's own docstring,
+        # point 2) was written to eliminate, just with the roles reversed. Raw fractions
+        # (not _pct100()'d) -- fine for sorting, a monotonic scalar transform.
         addon = [r for r in safe if r.get("addon_tranche") != "FRAGILE"
-                 and r.get("core_addon_cagr_pct") is not None]
-        addon.sort(key=_cagr_sort_key("core_addon_cagr_pct"), reverse=True)
+                 and r.get("addon_cagr_1s") is not None]
+        addon.sort(key=_cagr_sort_key("addon_cagr_1s"), reverse=True)
 
-        # core_drought_cagr_pct is None unless drought was BOTH genuinely computed (this
+        # drought_cagr_1s is None unless drought was BOTH genuinely computed (this
         # candidate's strategy supports it, see strategies.uses_arm_trail_exit) AND
         # verified robust (drought_ok, OR the IE vol-gate's own separately-validated
         # REAL_SELECTION override) -- candidate_full_review.py's own real fix, 2026-09-02.
         # `is not None` alone is now the correct full gate; a separate `drought_tranche !=
         # "FRAGILE"` check would be WRONG here (and was, before this fix) -- a
-        # REAL_SELECTION-verified row can have a real core_drought_cagr_pct while its base
+        # REAL_SELECTION-verified row can have a real drought_cagr_1s while its base
         # drought_tranche is still "FRAGILE" (the IE challenge validates a DIFFERENT number
         # than the raw chrono-split check), so gating on tranche in addition would exclude
         # a genuinely verified row for the wrong reason.
-        drought = [r for r in safe if r.get("core_drought_cagr_pct") is not None]
-        drought.sort(key=_cagr_sort_key("core_drought_cagr_pct"), reverse=True)
+        drought = [r for r in safe if r.get("drought_cagr_1s") is not None]
+        drought.sort(key=_cagr_sort_key("drought_cagr_1s"), reverse=True)
 
         best_both = [r for r in safe if r.get("strategy") == "TrailingBothZScoreBreakout"]
         best_both.sort(key=_cagr_sort_key("core_cagr_1s"), reverse=True)
@@ -1068,17 +1120,18 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
                     "caught) -- 'Drought %' is the one exception, filled directly since phase4_results."
                     "drought_compounded_pct matches its name+semantics exactly. check8/check11/check13/"
                     "core_addon_disagreement have no existing-column counterpart at all."])
-    def_ws.append(["Cagr (1m) / Cagr Add on (1m) / CAGR Drought (1m) / CAGR Both (1m) (item #3, 2026-09-02)",
-                    "The 1-minute-resolution sibling of the primary Cagr/Cagr Add on/CAGR Drought/CAGR Both "
-                    "columns -- same core_cagr_1m/addon_cagr_1m/drought_cagr_1m/core_both_cagr_1m fields "
-                    "phase5_second_level_overlay_check.py computes and candidate_verification_results "
+    def_ws.append(["Cagr (1m) (item #3, 2026-09-02; scope narrowed 2026-09-07)",
+                    "The 1-minute-resolution sibling of the primary Cagr column only -- same core_cagr_1m "
+                    "field phase5_second_level_overlay_check.py computes and candidate_verification_results "
                     "stores, at 1-minute bar resolution instead of the primary 1s (1-second) resolution. "
                     "1-minute is the COARSER, more fill-optimistic of the two (a whole extra minute of "
                     "intra-bar price movement to pick the most favorable fill inside) -- shown here for "
-                    "direct comparison only; the existing 1s-resolution columns remain the primary/trusted "
-                    "numbers for reporting/ranking, per feedback_cagr_over_robust_alpha's own convention. "
-                    "The two can diverge hugely: confirmed real case, ETHU node 19460, core_both_cagr_1m="
-                    "531.9% vs. core_both_cagr_1s=114.8%, a 417pp gap."])
+                    "direct comparison only; Cagr (1s) remains the primary/trusted number for reporting/ "
+                    "ranking, per feedback_cagr_over_robust_alpha's own convention. Confirmed real "
+                    "divergence case: ETHU node 19460, core_cagr_1m vs core_cagr_1s. Cagr Add on/CAGR "
+                    "Drought/CAGR Both no longer carry a 1m sibling in this report at all (2026-09-07,  "
+                    "user-confirmed layout) -- 1s is now the only resolution shown for those three; the "
+                    "raw 1m values remain queryable directly from candidate_verification_results."])
     def_ws.append(["Generated", _git_provenance_stamp()])
     def_ws.column_dimensions["A"].width = 32
     def_ws.column_dimensions["B"].width = 110
