@@ -49,8 +49,11 @@ Each invocation:
      yet.
 
 Logs one JSON line per POLL (not per day -- expect many lines/day at a
-15-minute cadence) to docs/corp_action_canary_log.jsonl (committed,
-append-only). Chosen over docs/research_log.md's free-form prose because this
+15-minute cadence) to logs/canaries/corp_action_canary_log.jsonl (gitignored
+runtime artifact, append-only -- moved 2026-09-08 from docs/, which is a
+committed directory and this data doesn't belong there; see logs/canaries/
+convention shared with schwab_auth_canary_log.jsonl). Chosen over docs/
+research_log.md's free-form prose because this
 needs weeks of dense, structured, machine-diffable entries -- a human or a
 future script can read consecutive lines to see exactly which poll each
 source's data changed, without parsing prose. Each line carries its own
@@ -89,7 +92,7 @@ from scripts.build_massive_hourly_derived import fetch_dividends
 
 TICKER = "SPY"
 EX_DIV_DATE = date(2026, 9, 18)
-LOG_PATH = ROOT / "docs" / "corp_action_canary_log.jsonl"
+LOG_PATH = ROOT / "logs" / "canaries" / "corp_action_canary_log.jsonl"
 YAHOO_WINDOW_DAYS = 30   # covers the ex-div date with buffer once it's elapsed
 MASSIVE_WINDOW_DAYS = 5  # small, cheap pull -- not a full-history fetch
 

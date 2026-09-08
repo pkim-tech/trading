@@ -31,8 +31,9 @@ NOT an append log, this is the "current status" daemon_morning_check.py reads):
 {last_checked_at, status (healthy/broken), last_known_good_at,
 first_detected_broken_at, last_reactive_alert_at, last_proactive_warning_for_creation_ts}.
 
-Full poll history appended to docs/schwab_auth_canary_log.jsonl (committed, same
-append-only convention as docs/corp_action_canary_log.jsonl) -- one line per poll:
+Full poll history appended to logs/canaries/schwab_auth_canary_log.jsonl
+(gitignored runtime artifact, moved 2026-09-08 from docs/ -- same append-only
+convention as logs/canaries/corp_action_canary_log.jsonl) -- one line per poll:
 {poll_timestamp, status, creation_timestamp, token_age_days, error}. This is the real
 data that answers the 7-vs-6.5-day question once enough real failures accumulate.
 
@@ -72,7 +73,7 @@ load_dotenv(ROOT / ".env")
 
 TOKEN_PATH = ROOT / "cache" / "live" / "schwab_token.json"
 STATE_PATH = ROOT / "cache" / "live" / "schwab_auth_canary_state.json"
-LOG_PATH = ROOT / "docs" / "schwab_auth_canary_log.jsonl"
+LOG_PATH = ROOT / "logs" / "canaries" / "schwab_auth_canary_log.jsonl"
 
 PROBE_TIMEOUT_SECS = 30      # hard wall-clock cap -- never lets a cron slot hang
 FOLLOWUP_NUDGE_GAP_HOURS = 4
