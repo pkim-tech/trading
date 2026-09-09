@@ -34,7 +34,8 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import strategies  # noqa: E402
 from backtester import simulate_drought_overlay_ground_truth, drought_included_excluded_ground_truth  # noqa: E402
-from candidate_verification_store import get_phase5_1s_trades  # noqa: E402
+from candidate_verification_store import get_phase5_1s_trades, upsert_phase4  # noqa: E402
+import db_cache  # noqa: E402
 from sim_1s_vs_1m_groundtruth_overlays import load_hourly  # noqa: E402
 from candidate_summary_report import _window_dates_from_version  # noqa: E402
 from run_optimization_sweep import (  # noqa: E402
@@ -100,7 +101,43 @@ def compute_fresh(conn, candidate_id):
 
     addon_ungated, drought_ungated, both_gated = _stacked_overlay_cagrs_gt(trades, drought, drought_ie, years)
     return dict(candidate_id=candidate_id, ticker=node["ticker"], ok=True, n_trades=len(trades),
-                years=years, core=core_cagr, addon=addon_ungated, drought=drought_ungated, both=both_gated)
+                years=years, core=core_cagr, addon=addon_ungated, drought=drought_ungated, both=both_gated,
+                _drought_raw=drought)
+
+
+def persist(conn, result):
+    """Writes a fresh compute_fresh() result into phase4_results via the real
+    upsert_phase4 (freshest-real-value merge, never clobbers an existing real value
+    with None) -- so a future report/comparison reads this candidate's numbers the
+    same way it would read any campaign-computed Phase4 row, no separate code path.
+
+    addon_cagr_pct (the pre-consolidation standalone addon field) is set to the same
+    value as core_addon_cagr_ungated_pct -- run_optimization_sweep._stacked_overlay_
+    cagrs_gt's own docstring documents these as the same quantity (both derived from
+    apply_addon_overlay_ground_truth's blended Return on the same trades), so this
+    avoids a redundant second addon evaluation rather than risking two numbers
+    drifting apart under one concept -- the exact bug class this whole consolidation
+    exists to eliminate."""
+    if not result["ok"]:
+        print(f"  SKIPPED persist for candidate_id={result['candidate_id']}: {result['reason']}")
+        return
+    drought = result.get("_drought_raw")
+    second_build_id = db_cache.get_active_build_id(result["ticker"], "second", conn=conn)
+    fields = {
+        "cagr_pct": result["core"],
+        "n_trades": result["n_trades"],
+        "addon_cagr_pct": result["addon"],
+        "drought_compounded_pct": drought.get("drought_compounded_pct") if drought else None,
+        "drought_combined_compounded_pct": drought.get("combined_compounded_pct") if drought else None,
+        "core_addon_cagr_ungated_pct": result["addon"],
+        "core_drought_cagr_ungated_pct": result["drought"],
+        "core_both_cagr_pct": result["both"],
+        "trades_resolution": "1s",
+        "second_build_id": second_build_id,
+    }
+    checked_at = upsert_phase4(conn, result["candidate_id"], fields)
+    print(f"  persisted candidate_id={result['candidate_id']} ({result['ticker']}) "
+          f"phase4_results @ {checked_at}")
 
 
 def fmt(v):
@@ -110,11 +147,16 @@ def fmt(v):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--candidate-id", action="append", type=int, required=True, dest="candidate_ids")
+    ap.add_argument("--persist", action="store_true",
+                     help="also write results into phase4_results via upsert_phase4")
     args = ap.parse_args()
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     results = [compute_fresh(conn, cid) for cid in args.candidate_ids]
+    if args.persist:
+        for r in results:
+            persist(conn, r)
     conn.close()
 
     print(f"{'candidate_id':>12s} {'ticker':6s} {'n_trades':>8s} {'years':>6s} "
