@@ -474,6 +474,26 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
 
     fr = full_review_by_id.get(node_id)
     if fr is not None:
+        # Safety-filtered display (2026-09-08, real user ask): blank Cagr Add on/CAGR
+        # Drought/CAGR Both whenever their own robustness gate fails, rather than always
+        # showing a number regardless -- so a row with all 3 overlay columns blank
+        # visually signals "only core itself is safe/verified, none of the overlays
+        # cleared their bar." Same gates _curate_combined_rows already uses to decide
+        # ranking eligibility (kept consistent with that, not reinvented): addon needs
+        # addon_tranche != 'FRAGILE'; drought needs EITHER its own tranche != 'FRAGILE'
+        # OR the separately-validated drought_ie_verdict == 'REAL_SELECTION' override
+        # (a REAL_SELECTION-verified row can have a real drought_cagr_1s while its base
+        # drought_tranche is still 'FRAGILE' -- the IE vol-gate challenge validates a
+        # DIFFERENT number than the raw chrono-split check, see _curate_combined_rows'
+        # own comment on this). core_both is blanked only when NEITHER addon nor drought
+        # passed -- if either did, core_both is a genuinely different (not core-
+        # equivalent) number and is worth showing even if the OTHER leg failed its gate.
+        # Scoped to Full Review rows only (fr is not None) -- a lightweight/raw-only row
+        # never computes addon_tranche/drought_tranche/drought_ie_verdict at all, so
+        # there is no real gate to check for it; left unchanged rather than guessing.
+        _addon_safe = fr.get("addon_tranche") != "FRAGILE"
+        _drought_safe = (fr.get("drought_tranche") != "FRAGILE"
+                          or fr.get("drought_ie_verdict") == "REAL_SELECTION")
         front = [
             fr["ticker"], counter_formula, node_id,
             _matches_promotion(fr["ticker"], node_id, promoted_ids), k1_fn(fr["ticker"]),
@@ -487,8 +507,9 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
             # core_addon_cagr_pct/core_drought_cagr_pct/core_both_cagr_pct, which this
             # branch used to source silently -- same proven kernel, but the OLD values
             # were stale relative to what Phase5 already re-verified.
-            _pct100(fr.get("addon_cagr_1s")), _pct100(fr.get("drought_cagr_1s")),
-            _pct100(fr.get("core_both_cagr_1s")),
+            _pct100(fr.get("addon_cagr_1s")) if _addon_safe else None,
+            _pct100(fr.get("drought_cagr_1s")) if _drought_safe else None,
+            _pct100(fr.get("core_both_cagr_1s")) if (_addon_safe or _drought_safe) else None,
         ]
         front_1m = [_pct100(fr.get("core_cagr_1m"))]
         checklist = [fr.get(h) for h in FIELDNAMES]
