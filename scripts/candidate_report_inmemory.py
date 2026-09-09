@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Curated candidate report for the in-memory sweep pipeline (candidate_nodes +
-candidate_verification_results) -- the successor to build_v6_promotion_combined_report.py,
+phase4_results, falling back to Phase5's candidate_verification_results for the
+historical population -- see fetch_rows) -- the successor to build_v6_promotion_combined_report.py,
 which only works off the legacy backtest_cache/discover_all_gt_scopes path (see
 project_in_memory_pipeline_is_production memory: candidate_nodes is production now).
 
@@ -31,14 +32,59 @@ COLUMNS = [
 ]
 
 
+def _phase4_available_columns(conn):
+    """phase4_results columns this DB actually has (empty set if the table is absent).
+    Column-level, not table-level: a research DB whose phase4_results predates the
+    2026-09-08 Phase5-consolidation migration would pass a table-existence check and then
+    die on `no such column` at query time. Read-only -- a report generator must not
+    migrate a DB it was merely pointed at."""
+    return {row[1] for row in conn.execute("PRAGMA table_info(phase4_results)")}
+
+
 def fetch_rows(conn, version):
+    """Phase4-preferred, Phase5-fallback (2026-09-08, paired-review MEDIUM finding).
+
+    This was an INNER JOIN against candidate_verification_results, which is written ONLY
+    by Phase5 -- and Phase5 stopped being invoked per campaign (see scripts/run_inmemory_
+    sweep_queue.sh), so as written it returned ZERO rows for every future campaign, and
+    main() below turns zero rows into a hard `SystemExit: No verified candidate_nodes
+    rows` -- a silent total emptying, not merely stale numbers. Now: LEFT JOIN both
+    sources, per-field COALESCE preferring Phase4 (its cagr_pct/core_addon_cagr_ungated_
+    pct/core_drought_cagr_ungated_pct come off the same trade list its own checks ran
+    against), falling back to Phase5 for the ~22k historical rows that only exist there.
+
+    The WHERE clause keeps this function's original "verified rows only" contract (that's
+    what distinguishes it from candidate_full_review_two_tab._raw_population_rows) by
+    requiring a real CAGR from EITHER source, rather than by requiring a Phase5 row to
+    exist. A bare LEFT JOIN with no such filter would instead pull in the entire
+    unverified candidate_nodes population, which is a different report.
+
+    Units: phase4_results stores real PERCENTAGES while candidate_verification_results
+    stores raw FRACTIONS. The /100 below puts the Phase4 side on the fraction convention
+    every consumer of these columns here (curate's sort keys, write_xlsx's cells) already
+    assumes -- mixing them is a 100x error."""
+    p4_cols = _phase4_available_columns(conn)
+
+    def coalesced(p4_col, p5_col):
+        if p4_col not in p4_cols:
+            return f"vr.{p5_col}"
+        return f"COALESCE(p4.{p4_col} / 100.0, vr.{p5_col})"
+
+    core_1s = coalesced("cagr_pct", "core_cagr_1s")
+    addon_1s = coalesced("core_addon_cagr_ungated_pct", "addon_cagr_1s")
+    drought_1s = coalesced("core_drought_cagr_ungated_pct", "drought_cagr_1s")
+    # Join phase4_results only when it exists -- otherwise the JOIN itself raises on an
+    # older DB even though every coalesced() above has already degraded to the vr. column.
+    p4_join = ("LEFT JOIN phase4_results p4 ON p4.candidate_id = n.id" if p4_cols else "")
     q = f"""
     SELECT n.{', n.'.join(COLUMNS[:14])},
-           vr.core_cagr_1m, vr.core_cagr_1s, vr.n_trades_1m, vr.n_trades_1s,
-           vr.addon_cagr_1m, vr.addon_cagr_1s, vr.drought_cagr_1m, vr.drought_cagr_1s
+           vr.core_cagr_1m, {core_1s}, vr.n_trades_1m, vr.n_trades_1s,
+           vr.addon_cagr_1m, {addon_1s}, vr.drought_cagr_1m, {drought_1s}
     FROM candidate_nodes n
-    JOIN candidate_verification_results vr ON vr.candidate_id = n.id
+    LEFT JOIN candidate_verification_results vr ON vr.candidate_id = n.id
+    {p4_join}
     WHERE n.version = ?
+      AND ({core_1s} IS NOT NULL OR {addon_1s} IS NOT NULL OR {drought_1s} IS NOT NULL)
     """
     cur = conn.execute(q, (version,))
     return [dict(zip(COLUMNS, r)) for r in cur.fetchall()]
@@ -47,7 +93,12 @@ def fetch_rows(conn, version):
 def curate(rows, top_n=2):
     """top_n (2026-09-01, user request via research-session dispatch, Phase 10 v2):
     top-N-per-category instead of the original hardcoded top-2. Default stays 2 --
-    byte-identical behavior for every existing caller that doesn't pass this."""
+    byte-identical behavior for every existing caller that doesn't pass this.
+
+    The core/addon/drought sort keys below read the SAME core_cagr_1s/addon_cagr_1s/
+    drought_cagr_1s dict keys fetch_rows produces, so they inherit its Phase4-preferred/
+    Phase5-fallback coalescing (and its fraction units) with no change needed here --
+    there is no second, independently-sourced read of those metrics in this module."""
     safety_known = any(r["worst_neighbor_cagr"] is not None for r in rows)
     if safety_known:
         rows = [r for r in rows if (r["worst_neighbor_cagr"] or 0) > 0]

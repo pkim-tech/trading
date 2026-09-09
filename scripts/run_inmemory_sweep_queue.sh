@@ -7,8 +7,9 @@
 # Per ticker, in order: run bench_phase1_phase2_inmemory.py once per strategy
 # (--fixed-sl-values loops fixed_sl 1-8 within that one process/pool, see that
 # script's own --fixed-sl-values help), then Phase4 (candidate_summary_report.py
-# --kernel gt) then Phase5 (phase5_second_level_overlay_check.py) against the
-# SAME campaign just produced, before moving to the next ticker. A ticker that
+# --kernel gt) against the SAME campaign just produced, before moving to the
+# next ticker. (Phase5 used to run here too -- disabled 2026-09-08, see the
+# commented-out block at its old call site below for why.) A ticker that
 # errors at any phase is logged (PROGRESS-style marker) and skipped -- the rest
 # of the queue keeps going, matching the user's explicit call that partial
 # completion across the 6-ticker queue is an acceptable outcome for a long
@@ -674,26 +675,44 @@ echo " In-memory sweep queue start — $(date)"
     $PYTHON scripts/candidate_summary_report.py --kernel gt "$JOB_TICKER" --version "$VERSION"
     rc4=$?
     if [ $rc4 -ne 0 ]; then
-      echo "PROGRESS: Phase4 FAILED ticker=$JOB_TICKER: exit code $rc4 -- skipping Phase5, continuing queue"
+      echo "PROGRESS: Phase4 FAILED ticker=$JOB_TICKER: exit code $rc4 -- continuing queue"
       continue
     fi
 
-    wait_while_paused  # Phase4's own pool has already exited by here
-    ticker_banner "$JOB_TICKER: Phase5 (phase5_second_level_overlay_check.py) start"
-    $PYTHON scripts/phase5_second_level_overlay_check.py --ticker "$JOB_TICKER" --version "$VERSION"
-    rc5=$?
-    if [ $rc5 -ne 0 ]; then
-      echo "PROGRESS: Phase5 FAILED ticker=$JOB_TICKER: exit code $rc5 -- continuing queue"
-      continue
-    fi
+    # ---------------------------------------------------------------------------
+    # Phase5 DISABLED for new campaigns (2026-09-08, user decision).
+    #
+    # Why: Phase5's only remaining unique output was the core+addon / core+drought /
+    # gated core_both overlay CAGRs (candidate_verification_results.addon_cagr_1s /
+    # drought_cagr_1s / core_both_cagr_1s), and Phase4 now computes exactly those
+    # itself, off the SAME 1s-preferred trade list its own checks 4/8/11/13 already
+    # run against (run_optimization_sweep._stacked_overlay_cagrs_gt ->
+    # phase4_results.core_addon_cagr_ungated_pct / core_drought_cagr_ungated_pct /
+    # core_both_cagr_pct -- the `_ungated` suffix is load-bearing, candidate_full_review.py
+    # already uses the unsuffixed names for the GATED flavor of the same concept).
+    #
+    # The report generators (scripts/candidate_full_review_two_tab.py, scripts/
+    # candidate_report_inmemory.py) read Phase4 FIRST but fall back per-field to Phase5's
+    # candidate_verification_results, so the ~22k historical rows that only ever went
+    # through Phase5 still render -- disabling Phase5 here only stops NEW writes.
+    # Two parallel computations of the same number is precisely the shape that produced
+    # both the node-mislabeling bug and the drought_factor_gated bug (fixed in 10f1945)
+    # -- one side kept going stale while attention was on the other. Removing the
+    # duplicate also saves a full extra resimulation pass over the whole candidate
+    # population per campaign (real wall-clock cost).
+    #
+    # DELIBERATELY NOT DELETED: scripts/phase5_second_level_overlay_check.py, the
+    # `phase5_trades` table, and `candidate_verification_results` all stay -- they hold
+    # real historical computation, Phase4 still READS phase5_trades as its preferred 1s
+    # trade source (candidate_verification_store.get_phase5_1s_trades), and Phase5
+    # remains runnable by hand for a genuine 1m-vs-1s granularity investigation, which
+    # is the one question it answers that Phase4 does not.
+    #
+    #   $PYTHON scripts/phase5_second_level_overlay_check.py --ticker "$JOB_TICKER" --version "$VERSION"
+    #   $PYTHON scripts/append_phase5_combined.py --version "$VERSION"
+    # ---------------------------------------------------------------------------
 
-    # Rebuilds the single running cross-campaign phase5_second_level_overlay_
-    # check_ALL_<VERSION> file from every per-ticker file that exists so far
-    # (2026-08-30, planner dispatch) -- so the user never has to open per-ticker
-    # files or manually re-merge as the campaign progresses.
-    $PYTHON scripts/append_phase5_combined.py --version "$VERSION"
-
-    ticker_banner "$JOB_TICKER: full Phase1->5 pipeline complete"
+    ticker_banner "$JOB_TICKER: full Phase1->4 pipeline complete"
   done
 
   echo ""

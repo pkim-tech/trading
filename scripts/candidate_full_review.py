@@ -243,7 +243,18 @@ COLUMN_DEFS = {
     "drought_late_wr_pct": "Drought win rate in the late (last ~30%) half.",
     "drought_wr_verdict": "STABLE / FADING / blank -- checklist item 4, applied to drought.",
     "drought_wr_tranche": "Clean bucket of drought_wr_verdict.",
-    "core_addon_cagr_pct": "Annualized CAGR of core stacked with add-on -- add-on's own factor is used only "
+    # NAME-COLLISION WARNING (2026-09-08 paired-review MEDIUM finding): THIS file's
+    # core_addon_cagr_pct/core_drought_cagr_pct are GATED (a FRAGILE overlay contributes a
+    # no-op 1.0x factor). Phase4 persists a same-concept-but-UNGATED pair to
+    # phase4_results, deliberately named core_addon_cagr_ungated_pct/
+    # core_drought_cagr_ungated_pct precisely so the two never share a name -- if you are
+    # comparing a number from this report against one from candidate_summary_report.py /
+    # phase4_results, check the suffix first; a gated and an ungated stack are genuinely
+    # different numbers. core_both_cagr_pct is the one name that means the same thing in
+    # both places (gated in both). See run_optimization_sweep._stacked_overlay_cagrs_gt.
+    "core_addon_cagr_pct": "Annualized CAGR of core stacked with add-on (GATED -- see also phase4_results' "
+                            "separately-named core_addon_cagr_ungated_pct, which is NOT this number) -- "
+                            "add-on's own factor is used only "
                             "if addon_robustness_verdict is OK, otherwise treated as a no-op (1x, i.e. equal "
                             "to strategy_cagr_pct) so a FRAGILE overlay can't inflate the combined number.",
     "core_drought_cagr_pct": "Same as core_addon_cagr_pct, for drought (gated on drought_robustness_verdict) -- "

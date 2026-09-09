@@ -3576,6 +3576,132 @@ def _check8_fluke_gt(trades):
     }
 
 
+def _compounded_pct_gt(rets):
+    """Compound a list of return FRACTIONS into a total-return percentage. Verbatim copy
+    of scripts/candidate_full_review.py::compounded / scripts/candidate_summary_report.py::
+    compounded / scripts/phase5_second_level_overlay_check.py::_compounded (all three are
+    already the same 5-line function, vendored rather than imported for the same reason
+    given below)."""
+    prod = 1.0
+    for r in rets:
+        prod *= (1 + r)
+    return (prod - 1) * 100
+
+
+def _chrono_split_verdict_gt(rets):
+    """Chronological-split robustness VERDICT only (docs/overlay_parameter_robustness_
+    process.md steps 1/3): half1/half2 chronological split + single-biggest-trade removal.
+    Ported verbatim from scripts/candidate_full_review.py::_chrono_split_robustness (its
+    verdict half; the win-rate-stability half of that function isn't needed here) -- the
+    SAME port scripts/phase5_second_level_overlay_check.py::_chrono_split_robustness_
+    verdict already carries, for the same reason: candidate_full_review.py imports THIS
+    module at module level, so importing it back here would be circular, and it also drags
+    in a heavy (partly broken) dependency chain. Ported rather than imported, matching
+    _check4_stability_gt/_check8_fluke_gt's own established convention in this file.
+    `rets` must already be chronologically ordered (this function does no sorting).
+    Returns None for <2 rets."""
+    if len(rets) < 2:
+        return None
+    mid = len(rets) // 2
+    half1_pct, half2_pct = _compounded_pct_gt(rets[:mid]), _compounded_pct_gt(rets[mid:])
+    comp_all = _compounded_pct_gt(rets)
+    biggest_idx = max(range(len(rets)), key=lambda i: rets[i])
+    without_biggest = rets[:biggest_idx] + rets[biggest_idx + 1:]
+    comp_without = _compounded_pct_gt(without_biggest) if without_biggest else 0.0
+    if (comp_all > 0) != (comp_without > 0):
+        return "FRAGILE (sign flip)"
+    if half1_pct < 0 or half2_pct < 0:
+        return "FRAGILE (half negative)"
+    return "OK"
+
+
+def _stacked_overlay_cagrs_gt(trades, drought, drought_ie, years):
+    """Phase4's OWN core+add-on / core+drought / core+add-on+drought stacked CAGRs,
+    computed from the SAME `trades` list the row's checks 4/8/11/13 and core_cagr already
+    ran against (so whatever resolution that list was served at -- '1s' from phase5_trades,
+    a minute cache hit, or a fresh second/minute resim -- is what these numbers inherit,
+    with no second, independently-resolved trade list anywhere).
+
+    Consolidation, 2026-09-08: this is the port of scripts/phase5_second_level_overlay_
+    check.py::overlay_cagrs into Phase4, so a campaign no longer needs a separate Phase5
+    resimulation pass just to get these three numbers. Every recurring bug in this area
+    (the node-mislabeling bug; the drought_factor_gated bug fixed in 10f1945) came from
+    two parallel computations of the same number drifting apart -- this removes one of
+    them. Phase5's code and tables are deliberately KEPT (historical computation, "never
+    delete data"), it just stops being invoked per-campaign.
+
+    NAMING WARNING (2026-09-08 paired-review MEDIUM finding -- read before renaming
+    anything here back): the first two numbers below are UNGATED, and are deliberately
+    named `core_addon_cagr_ungated`/`core_drought_cagr_ungated` (persisted as
+    phase4_results.core_addon_cagr_ungated_pct/core_drought_cagr_ungated_pct). Do NOT
+    call them `core_addon_cagr_pct`/`core_drought_cagr_pct` -- scripts/candidate_full_
+    review.py already produces in-memory record keys with EXACTLY those two names holding
+    a GATED number (each overlay zeroed to a no-op 1.0x factor unless its own chrono-split
+    robustness verdict passes, plus the drought IE override), and scripts/build_portfolio_
+    prototype.py reads that gated flavor by name out of candidate_full_review's xlsx. Two
+    genuinely different numbers under one name is the collision this suffix exists to
+    prevent. Only `core_both_cagr` means the same thing in both places (both gated).
+
+    Semantics, matched deliberately:
+      - core_addon_cagr_ungated: UNGATED core+add-on, from apply_addon_overlay_ground_
+        truth's BLENDED per-trade 'Return' -- identical to Phase5's own `addon_cagr`.
+      - core_drought_cagr_ungated: UNGATED core+drought, from the drought sweep's own
+        `combined_compounded_pct` -- identical to Phase5's own `drought_cagr`.
+      - core_both_cagr: triple-stacked and independently GATED per overlay
+        (core_factor * addon_factor_gated * drought_factor_gated), identical to
+        scripts/candidate_full_review.py's own core_both_cagr_pct formula and to Phase5's
+        `core_both_cagr`, PLUS candidate_full_review.py's drought included-vs-excluded
+        vol-gate override (a REAL_SELECTION drought_ie REPLACES the plain drought factor
+        with its included-only compounded return). Phase5 never had that override -- it
+        doesn't compute drought_ie at all -- so this is the one deliberate, known
+        divergence from Phase5's stored core_both_cagr_1s, and it is the more-informed
+        number (see candidate_full_review.py's own 2026-08-09 note on the two
+        computations previously being silently disconnected).
+
+    The add-on gate's per-trade return is the UNBLENDED (Exit-Arm)/Arm leg return, NOT
+    apply_addon_overlay_ground_truth's blended 'Return' (which already contains core's own
+    return) -- same double-counting trap candidate_full_review.py's 2026-08-23 paired-
+    review CRITICAL finding and Phase5's own overlay_cagrs docstring both call out.
+
+    Returns (core_addon_cagr_ungated_pct, core_drought_cagr_ungated_pct,
+    core_both_cagr_pct), each a real percentage (Phase5 stores the same quantities as raw
+    fractions) or None."""
+    if not trades or not years:
+        return None, None, None
+    addon_trades = apply_addon_overlay_ground_truth(trades)
+    core_total_pct = _compounded_pct_gt([t["Return_core"] for t in addon_trades])
+    addon_total_pct = _compounded_pct_gt([t["Return"] for t in addon_trades])
+    core_addon_cagr_ungated = _cagr_from_total_return(addon_total_pct, years)
+
+    armed = [t for t in addon_trades if t.get("armed")]
+    addon_rets = [(t["Exit Price"] - t["Arm Price"]) / t["Arm Price"] for t in armed]
+    addon_compounded_pct = _compounded_pct_gt(addon_rets) if addon_rets else None
+    addon_ok = len(addon_rets) >= 2 and _chrono_split_verdict_gt(addon_rets) == "OK"
+
+    core_drought_cagr_ungated = None
+    drought_compounded_pct = None
+    drought_ok = False
+    if drought is not None:
+        if drought.get("combined_compounded_pct") is not None:
+            core_drought_cagr_ungated = _cagr_from_total_return(
+                drought["combined_compounded_pct"], years)
+        drought_compounded_pct = drought.get("drought_compounded_pct")
+        drought_rets = drought.get("best_rets")
+        drought_ok = (drought_rets is not None and len(drought_rets) >= 2 and
+                      _chrono_split_verdict_gt(drought_rets) == "OK")
+
+    addon_factor_gated = (1.0 + addon_compounded_pct / 100.0) if (
+        addon_compounded_pct is not None and addon_ok) else 1.0
+    drought_factor_gated = (1.0 + drought_compounded_pct / 100.0) if (
+        drought_compounded_pct is not None and drought_ok) else 1.0
+    if drought_ie is not None and drought_ie.get("verdict") == "REAL_SELECTION":
+        drought_factor_gated = 1.0 + drought_ie["included_compounded_pct"] / 100.0
+    core_factor = 1.0 + core_total_pct / 100.0
+    core_both_cagr = _cagr_from_total_return(
+        (core_factor * addon_factor_gated * drought_factor_gated - 1.0) * 100.0, years)
+    return core_addon_cagr_ungated, core_drought_cagr_ungated, core_both_cagr
+
+
 def _check11_max_drawdown_gt(trades):
     """Check 11 (max drawdown), same convention as scripts/v4_max_drawdown.max_drawdown --
     pure function of the compounded equity curve (cumulative product of 1+Return per
@@ -3935,6 +4061,28 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                         arm_pct=float(cand['take_profit']), trail_sell_pct=_drought_trail_sell_pct,
                         confirm_days=drought['best_confirm_days'], vol_gate=GT_DROUGHT_IE_VOL_GATE)
 
+            # Phase4's own stacked overlay CAGRs (2026-09-08 Phase5-consolidation) --
+            # computed HERE, off the same `trades`/`drought`/`drought_ie` this loop just
+            # resolved, so no separate Phase5 resimulation pass is needed to produce
+            # them. See _stacked_overlay_cagrs_gt's docstring for the exact semantics and
+            # the one deliberate divergence from Phase5's stored numbers (the drought_ie
+            # REAL_SELECTION override, which Phase5 never had).
+            #
+            # Skipped entirely for phase4_eligible=False candidates (2026-09-08 paired-
+            # review LOW finding), matching the SAME convention the add-on pass above
+            # (`phase4_candidates` filter) and the drought pass directly above already
+            # follow, and matching candidate_summary_report.GT_COLUMN_DEFS' documented
+            # "blank when phase4_eligible is False (skipped, not worth the compute)" note
+            # for addon_cagr_pct. All THREE are left None, not just the two ungated ones:
+            # core_both's addon leg would still cost a full apply_addon_overlay_ground_
+            # truth pass (defeating the compute-skip), and with drought already skipped
+            # its drought factor degenerates to a neutral 1.0, making it a mere duplicate
+            # of the add-on number rather than a real triple stack.
+            core_addon_cagr_ungated = core_drought_cagr_ungated = core_both_cagr = None
+            if cand.get('phase4_eligible', True):
+                core_addon_cagr_ungated, core_drought_cagr_ungated, core_both_cagr = (
+                    _stacked_overlay_cagrs_gt(trades, drought, drought_ie, years))
+
             core_cliff = addon['core_cliff']
             addon_cliff = addon['addon_cliff']
             disagreement = (core_cliff is not None and addon_cliff is not None and core_cliff != addon_cliff)
@@ -3963,6 +4111,16 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 # `core_cagr` assignment) -- the resolution-aware headline number a
                 # downstream reader/persister should prefer over `candidate['cagr']`.
                 'core_cagr': core_cagr,
+                # Stacked overlay CAGRs, Phase4-computed (2026-09-08) -- real percentages,
+                # same `trades` list as core_cagr above. These are the fields a downstream
+                # report generator should read INSTEAD of Phase5's addon_cagr_1s/
+                # drought_cagr_1s/core_both_cagr_1s from candidate_verification_results.
+                # The `_ungated` suffix on the first two is load-bearing -- see
+                # _stacked_overlay_cagrs_gt's NAMING WARNING for the gated/ungated
+                # collision with candidate_full_review.py's identically-shaped keys.
+                'core_addon_cagr_ungated': core_addon_cagr_ungated,
+                'core_drought_cagr_ungated': core_drought_cagr_ungated,
+                'core_both_cagr': core_both_cagr,
                 # second_build_id (2026-09-07, Review-Gate Persistence Rule item --
                 # contextual paired-review HIGH finding): the SPECIFIC massive_second_
                 # derived build_id active when this row's trades_resolution was decided
@@ -4169,6 +4327,14 @@ def print_candidate_report_ground_truth(report):
                   f"df_hourly_windowed's index).")
         elif report.get('drought_skip_reason'):
             print(f"  Drought overlay: skipped ({report['drought_skip_reason']})")
+        # Stacked overlay CAGRs, Phase4-computed (2026-09-08 Phase5-consolidation) --
+        # printed so a reader of this report can see them without querying phase4_results.
+        _stack = [('+addon(ungated)', row.get('core_addon_cagr_ungated')),
+                  ('+drought(ungated)', row.get('core_drought_cagr_ungated')),
+                  ('+both(gated)', row.get('core_both_cagr'))]
+        if any(v is not None for _, v in _stack):
+            print("  Stacked overlay CAGR: " + "  ".join(
+                f"{lbl}={'n/a' if v is None else f'{v:.1f}%'}" for lbl, v in _stack))
         print()
 
 

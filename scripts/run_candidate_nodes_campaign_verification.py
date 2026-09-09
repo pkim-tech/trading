@@ -69,6 +69,11 @@ def _phase4_fields_from_row(row):
         # report.gt_rows_for_scope's own `out` dict.
         "trades_resolution": row.get("trades_resolution"),
         "second_build_id": row.get("second_build_id"),
+        # Phase4's own stacked overlay CAGRs (2026-09-08 Phase5-consolidation) --
+        # threaded straight through from gt_rows_for_scope's `out` dict, same as above.
+        "core_addon_cagr_ungated_pct": row.get("core_addon_cagr_ungated_pct"),
+        "core_drought_cagr_ungated_pct": row.get("core_drought_cagr_ungated_pct"),
+        "core_both_cagr_pct": row.get("core_both_cagr_pct"),
     }
 
 
@@ -235,8 +240,18 @@ def main():
     #     run_phase3(args.ticker, args.version, args.window, args.data_source)
     if "phase4" not in args.skip:
         run_phase4(args.ticker, args.version, args.window, args.data_source)
-    if "phase5" not in args.skip:
-        run_phase5(args.ticker, args.version, args.window, args.data_source, args.workers)
+    # Phase5 retired as an active step, 2026-09-08 (user decision) -- same treatment, and
+    # same file-level precedent, as Phase3 above: run_phase5() and phase5_second_level_
+    # overlay_check.py stay in place (and phase5_trades/candidate_verification_results are
+    # NOT touched -- real historical computation, and Phase4 still READS phase5_trades as
+    # its preferred 1s trade source), it's just no longer invoked per campaign. Phase4 now
+    # computes the overlay CAGRs Phase5 uniquely produced (addon/drought/gated core_both)
+    # itself, off the SAME trade list its own checks run against -- see run_optimization_
+    # sweep._stacked_overlay_cagrs_gt and the matching disabled block in
+    # scripts/run_inmemory_sweep_queue.sh. Run Phase5 by hand for a genuine 1m-vs-1s
+    # granularity investigation, the one question it answers that Phase4 does not.
+    # if "phase5" not in args.skip:
+    #     run_phase5(args.ticker, args.version, args.window, args.data_source, args.workers)
     print(f"\nAll phases done in {time.monotonic()-t_all:.1f}s total.")
 
 

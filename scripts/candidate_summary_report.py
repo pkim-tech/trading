@@ -181,6 +181,23 @@ GT_COLUMN_DEFS = {
                        "a future account-assignment decision, not just a property of today's account. Blank when "
                        "phase4_eligible is False (skipped, not worth the compute) -- check that column first "
                        "before reading a blank here as a real compute failure.",
+    "core_addon_cagr_ungated_pct": "Core+add-on stacked CAGR (UNGATED -- the add-on leg contributes its raw number "
+                            "whether or not it passed its own chrono-split robustness check; the `_ungated` suffix "
+                            "distinguishes it from candidate_full_review.py's identically-shaped but GATED "
+                            "core_addon_cagr_pct, a genuinely different number). Computed by Phase4 off this row's "
+                            "own trade list (same list cagr_pct/trades_resolution describe). Phase4-side replacement "
+                            "for Phase5's addon_cagr_1s -- see run_optimization_sweep._stacked_overlay_cagrs_gt. "
+                            "Blank when phase4_eligible is False (skipped, not worth the compute).",
+    "core_drought_cagr_ungated_pct": "Core+drought stacked CAGR (UNGATED, same suffix rationale as "
+                              "core_addon_cagr_ungated_pct above), from the drought sweep's own combined compounded "
+                              "return. Phase4-side replacement for Phase5's drought_cagr_1s. Blank when "
+                              "phase4_eligible is False, and also blank whenever drought was never computed.",
+    "core_both_cagr_pct": "Core+add-on+drought triple-stacked CAGR, each overlay independently GATED on its own "
+                           "chronological-split robustness verdict (plus the drought included-vs-excluded "
+                           "REAL_SELECTION vol-gate override). Phase4-side replacement for Phase5's "
+                           "core_both_cagr_1s. Unlike its two ungated siblings above, this one IS the same "
+                           "quantity candidate_full_review.py's core_both_cagr_pct means, so it keeps that name. "
+                           "Blank when phase4_eligible is False.",
     "addon_eligible": "Whether this ticker is CURRENTLY on a margin-capable account (schwab_safety's real "
                        "margin_capable gate) -- annotation only, does not gate addon_cagr_pct's computation.",
     "addon_eligibility_reason": "Human-readable reason for addon_eligible's value.",
@@ -1103,6 +1120,18 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             "core_safe": row["core_safe"], "addon_safe": row["addon_safe"],
             "core_addon_disagreement": row["core_addon_disagreement"],
             "addon_cagr_pct": own["addon_cagr"] if own else None,
+            # Phase4's own stacked overlay CAGRs (2026-09-08 Phase5-consolidation) --
+            # distinct from "addon_cagr_pct" directly above, which is the add-on cliff-
+            # safety pass's OWN-CELL number. These three are the per-candidate core+addon
+            # / core+drought / gated triple-stack, computed off the same trade list as
+            # cagr_pct -- see run_optimization_sweep._stacked_overlay_cagrs_gt. They are
+            # the Phase4-side replacement for Phase5's addon_cagr_1s/drought_cagr_1s/
+            # core_both_cagr_1s (real percentages here; Phase5 stored raw fractions).
+            # `_ungated` suffix on the first two is load-bearing -- candidate_full_review.py
+            # emits GATED numbers under the unsuffixed names (see GT_COLUMN_DEFS above).
+            "core_addon_cagr_ungated_pct": row.get("core_addon_cagr_ungated"),
+            "core_drought_cagr_ungated_pct": row.get("core_drought_cagr_ungated"),
+            "core_both_cagr_pct": row.get("core_both_cagr"),
             "addon_eligible": report["addon_eligible"],
             "addon_eligibility_reason": report["addon_eligibility_reason"],
             "phase4_eligible": row.get("phase4_eligible", True),

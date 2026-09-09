@@ -665,6 +665,41 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
             ws[f"{letter}{row}"].fill = highlight_fill
 
 
+# phase4_results column -> the csv_row key it feeds, for the four CAGR fields Phase4 can
+# supply (2026-09-08). Every value on the Phase4 side is a real PERCENTAGE and every
+# csv_row key here carries the raw-FRACTION convention, so this map is also the single
+# place the /100 conversion is applied -- do not read these columns anywhere else in this
+# module without it. `core_cagr_1m` is deliberately absent: Phase4 has no 1-minute
+# counterpart at all.
+_P4_FRACTION_FIELDS = {
+    "cagr_pct": "core_cagr_1s",
+    "core_addon_cagr_ungated_pct": "addon_cagr_1s",
+    "core_drought_cagr_ungated_pct": "drought_cagr_1s",
+    "core_both_cagr_pct": "core_both_cagr_1s",
+}
+# candidate_verification_results columns read as the Phase5 fallback, in csv_row-key
+# terms (the two names happen to coincide there, so no rename map is needed).
+_P5_FIELDS = ("core_cagr_1s", "core_cagr_1m", "addon_cagr_1s", "drought_cagr_1s",
+              "core_both_cagr_1s")
+
+
+def _phase4_available_columns(conn):
+    """The set of phase4_results columns this DB actually has, or an empty set if the
+    table doesn't exist at all.
+
+    Deliberately a COLUMN-level probe, not the `SELECT 1 FROM sqlite_master WHERE
+    name='phase4_results'` table-existence check this started as (2026-09-08 paired-review
+    MEDIUM finding): a research DB whose phase4_results predates the Phase5-consolidation
+    migration -- a .bak restore, a copy from another machine, any DB that hasn't had
+    candidate_verification_store.ensure_phase4_table run against it since -- passes a
+    table-existence guard and then dies on `OperationalError: no such column:
+    core_both_cagr_pct` at query time. PRAGMA table_info returns zero rows for a missing
+    table, so this one probe covers both cases. Read-only by construction: this module is
+    a report generator and must not migrate a DB it was merely pointed at (which is also
+    why ensure_phase4_table is NOT called here)."""
+    return {row[1] for row in conn.execute("PRAGMA table_info(phase4_results)")}
+
+
 def _enrich_full_review_core_cagr(conn, csv_rows):
     """Attaches the real core_cagr_1s (candidate_verification_results, keyed by node_id)
     onto each Full Review csv_row -- v4 fix (2026-09-01, user-confirmed). Full Review's
@@ -675,37 +710,89 @@ def _enrich_full_review_core_cagr(conn, csv_rows):
     and what the Combined tab's 'Cagr' column shows, per the standing project convention
     of CAGR over robust_alpha for reporting/ranking (feedback_cagr_over_robust_alpha).
 
+    ALL FIVE cagr keys (2026-09-08, Phase5-consolidation + its paired-review HIGH fixes):
+    every one of core_cagr_1s/addon_cagr_1s/drought_cagr_1s/core_both_cagr_1s now prefers
+    `phase4_results` and FALLS BACK to Phase5's candidate_verification_results, per
+    candidate, per field (a COALESCE, not an either/or switch). Both halves of that are
+    load-bearing:
+
+      - Prefer-Phase4, because Phase5 is no longer invoked per campaign (see scripts/
+        run_inmemory_sweep_queue.sh), so nothing writes candidate_verification_results for
+        a NEW campaign at all. Sourcing core_cagr_1s from Phase5 alone would leave the
+        headline 'Cagr' column blank for every future candidate -- and, worse than blank,
+        would silently corrupt the Best TrailingBoth/Best Core categories below, whose
+        sort key IS core_cagr_1s and whose _cagr_sort_key maps None to -inf, degenerating
+        the "winner" into an arbitrary insertion-order pick still labelled as a CAGR win.
+        Phase4's own resolution-aware cagr_pct is the same metric off the same trade list.
+      - Fall-back-to-Phase5, because the historical population is overwhelmingly Phase5-
+        only: measured on the real research DB 2026-09-08, candidate_verification_results
+        holds ~22.2k rows with real core/addon CAGRs while phase4_results holds only a few
+        hundred with the corresponding columns populated. A hard cutover would blank
+        almost the entire existing population the first time the report ran, emptying the
+        Best Add On/Best Drought/Best Overlay categories outright.
+
+    Unit conversion is part of the fallback: phase4_results stores real PERCENTAGES,
+    candidate_verification_results stores raw FRACTIONS. The Phase4 side is divided by 100
+    at read time so these dict keys keep the fraction convention they have always carried,
+    and every downstream consumer (_pct100() front-row builds, category sort keys) is
+    untouched. Mixing the two units silently is a 100x error, so the conversion lives at
+    exactly one place -- the _P4_FRACTION_FIELDS map below.
+
+    core_cagr_1m has NO Phase4 counterpart (Phase4 doesn't produce a separate 1-minute
+    resolution number; its single cagr_pct carries whatever trades_resolution served it),
+    so that one key stays Phase5-only and simply goes blank for a Phase5-less campaign --
+    a genuinely absent number, not a mislabeled one, and it is not a sort key anywhere.
+
+    Supersedes the note below.
+
     addon_cagr_1s/drought_cagr_1s/core_both_cagr_1s (2026-09-07, real mislabeling bug fix
     -- confirmed live, node 43258): _curated_front_and_checklist's Full-Review-match
     branch was sourcing its 'Cagr Add on'/'CAGR Drought'/'CAGR Both' columns from Phase4's
     OWN core_addon_cagr_pct/core_drought_cagr_pct/core_both_cagr_pct fields instead of
-    these proven-correct Phase5 1s values -- Phase5's overlay_cagrs() calls the same
+    these proven-correct Phase5 1s values (NOTE, for anyone reading this superseded entry
+    after 2026-09-08: those three names refer to the GATED per-row fields candidate_full_
+    review.gt_full_review_rows emits, which still carry exactly those names -- NOT the
+    UNGATED phase4_results.core_addon_cagr_ungated_pct/core_drought_cagr_ungated_pct
+    columns introduced above, whose `_ungated` suffix exists precisely to keep the two
+    apart) -- Phase5's overlay_cagrs() calls the same
     underlying kernel functions Phase4 does, so these ARE the canonical numbers, not a
     second opinion. Pulled here (not recomputed) since no new compute is needed."""
     ids = [r["node_id"] for r in csv_rows if r.get("node_id") is not None]
-    cagr_map = {}
-    cagr_1m_map = {}
-    cagr_1s_overlay_map = {}
+    _p4_cols = _phase4_available_columns(conn)
+    # Only the Phase4 columns actually PRESENT in this DB are selected -- see
+    # _phase4_available_columns' own note on why table-existence alone is not a safe guard.
+    _p4_selected = [c for c in _P4_FRACTION_FIELDS if c in _p4_cols]
+    p4_map = {}
+    p5_map = {}
     if ids:
         placeholders = ",".join("?" * len(ids))
-        cagr_map = dict(conn.execute(
-            f"SELECT candidate_id, core_cagr_1s FROM candidate_verification_results "
-            f"WHERE candidate_id IN ({placeholders})", ids))
-        # item #3 (2026-09-02): the 1-minute-resolution sibling of core Cagr only (2026-09-07:
-        # addon/drought/both no longer carry a 1m sibling in this report at all) -- a raw
-        # fraction straight from candidate_verification_results, same as core_cagr_1s, so
-        # the front-row build below still needs _pct100() on it.
-        cagr_1m_map = dict(conn.execute(
-            f"SELECT candidate_id, core_cagr_1m FROM candidate_verification_results "
-            f"WHERE candidate_id IN ({placeholders})", ids))
-        cagr_1s_overlay_map = {row[0]: row[1:] for row in conn.execute(
-            f"SELECT candidate_id, addon_cagr_1s, drought_cagr_1s, core_both_cagr_1s "
-            f"FROM candidate_verification_results WHERE candidate_id IN ({placeholders})", ids)}
+        # Phase5 side (candidate_verification_results) -- the historical population and,
+        # for core_cagr_1m, still the only source. Raw fractions, used as-is.
+        p5_map = {row[0]: dict(zip(_P5_FIELDS, row[1:])) for row in conn.execute(
+            f"SELECT candidate_id, {', '.join(_P5_FIELDS)} FROM candidate_verification_results "
+            f"WHERE candidate_id IN ({placeholders})", ids)}
+        # Phase4 side (phase4_results), preferred where present. Stored as real
+        # PERCENTAGES -- converted to fractions HERE, the single conversion point, so the
+        # merge below compares/substitutes like for like.
+        if _p4_selected:
+            p4_map = {row[0]: {_P4_FRACTION_FIELDS[c]: (None if v is None else v / 100.0)
+                               for c, v in zip(_p4_selected, row[1:])}
+                      for row in conn.execute(
+                f"SELECT candidate_id, {', '.join(_p4_selected)} FROM phase4_results "
+                f"WHERE candidate_id IN ({placeholders})", ids)}
     for r in csv_rows:
-        r["core_cagr_1s"] = cagr_map.get(r.get("node_id"))
-        r["core_cagr_1m"] = cagr_1m_map.get(r.get("node_id"))
-        m1s = cagr_1s_overlay_map.get(r.get("node_id")) or (None, None, None)
-        r["addon_cagr_1s"], r["drought_cagr_1s"], r["core_both_cagr_1s"] = m1s
+        nid = r.get("node_id")
+        p4 = p4_map.get(nid) or {}
+        p5 = p5_map.get(nid) or {}
+        # Per-FIELD COALESCE, not per-row: a candidate can legitimately have a Phase4
+        # cagr_pct but a NULL core_both_cagr_pct (drought never ran, or phase4_eligible
+        # was False), and in that case the Phase5 value for the missing field is still
+        # the best number available. Picking one whole source per row would throw it away.
+        for field in ("core_cagr_1s", "addon_cagr_1s", "drought_cagr_1s", "core_both_cagr_1s"):
+            v = p4.get(field)
+            r[field] = p5.get(field) if v is None else v
+        # No Phase4 counterpart exists for the 1m sibling -- Phase5-only by construction.
+        r["core_cagr_1m"] = p5.get("core_cagr_1m")
     return csv_rows
 
 
@@ -855,13 +942,31 @@ def _raw_population_rows(conn, version):
     results has no row for it yet) still appears, with NULL lightweight-metric columns --
     the true raw population, verified or not (candidate_report_inmemory.fetch_rows' own
     INNER JOIN deliberately only wants verified rows for ITS purpose; this is a different
-    purpose)."""
+    purpose).
+
+    Phase4-preferred, Phase5-fallback (2026-09-08): the four CAGR columns Phase4 can also
+    supply use the same per-field COALESCE (and the same /100 percentage->fraction
+    conversion) as _enrich_full_review_core_cagr -- without it this tab's Cagr columns go
+    entirely blank for any campaign run after Phase5 stopped being invoked. Built from
+    _phase4_available_columns so a DB whose phase4_results predates that migration falls
+    back to the plain Phase5 columns instead of raising `no such column`."""
     cn_cols = cri.COLUMNS[:14]
+    _p4_cols = _phase4_available_columns(conn)
+
+    def _coalesced(p4_col, p5_col):
+        if p4_col not in _p4_cols:
+            return f"vr.{p5_col}"
+        return f"COALESCE(p4.{p4_col} / 100.0, vr.{p5_col})"
+
+    _core_1s = _coalesced("cagr_pct", "core_cagr_1s")
+    _addon_1s = _coalesced("core_addon_cagr_ungated_pct", "addon_cagr_1s")
+    _drought_1s = _coalesced("core_drought_cagr_ungated_pct", "drought_cagr_1s")
+    _both_1s = _coalesced("core_both_cagr_pct", "core_both_cagr_1s")
     q = f"""
     SELECT n.{', n.'.join(cn_cols)},
-           vr.core_cagr_1m, vr.core_cagr_1s, vr.n_trades_1m, vr.n_trades_1s,
-           vr.addon_cagr_1m, vr.addon_cagr_1s, vr.drought_cagr_1m, vr.drought_cagr_1s,
-           vr.core_both_cagr_1m, vr.core_both_cagr_1s, p4.core_safe
+           vr.core_cagr_1m, {_core_1s}, vr.n_trades_1m, vr.n_trades_1s,
+           vr.addon_cagr_1m, {_addon_1s}, vr.drought_cagr_1m, {_drought_1s},
+           vr.core_both_cagr_1m, {_both_1s}, p4.core_safe
     FROM candidate_nodes n
     LEFT JOIN candidate_verification_results vr ON vr.candidate_id = n.id
     LEFT JOIN phase4_results p4 ON p4.candidate_id = n.id

@@ -435,6 +435,20 @@ _PHASE4_VALUE_COLUMNS = [
     # one after the fact (previously computed and threaded all the way to the report's
     # `out` dict, but discarded before ever reaching this table).
     "trades_resolution", "second_build_id",
+    # Phase4's own stacked overlay CAGRs (2026-09-08, Phase5-consolidation): Phase4 now
+    # computes core+addon / core+drought / gated-triple-stack itself, off the same trade
+    # list its own checks ran against (run_optimization_sweep._stacked_overlay_cagrs_gt),
+    # so a report generator no longer needs candidate_verification_results' Phase5-written
+    # addon_cagr_1s/drought_cagr_1s/core_both_cagr_1s for these. Stored as real PERCENTAGES
+    # here (Phase5 stored the same quantities as raw fractions -- do not mix the two).
+    # The `_ungated` suffix on the first two is deliberate and load-bearing (2026-09-08
+    # paired-review MEDIUM finding): scripts/candidate_full_review.py already emits
+    # in-memory keys named exactly `core_addon_cagr_pct`/`core_drought_cagr_pct` holding
+    # the GATED flavor of the same concept (and scripts/build_portfolio_prototype.py reads
+    # that flavor by name), so the unsuffixed names must NOT be reused here. Only
+    # core_both_cagr_pct is the same quantity in both places. See run_optimization_sweep.
+    # _stacked_overlay_cagrs_gt's NAMING WARNING.
+    "core_addon_cagr_ungated_pct", "core_drought_cagr_ungated_pct", "core_both_cagr_pct",
 ]
 
 
@@ -453,6 +467,8 @@ def ensure_phase4_table(conn):
             check13_worst_fold_cagr_pct REAL, check13_any_fold_fragile INTEGER,
             addon_cagr_pct REAL, drought_compounded_pct REAL, drought_combined_compounded_pct REAL,
             trades_resolution TEXT, second_build_id INTEGER,
+            core_addon_cagr_ungated_pct REAL, core_drought_cagr_ungated_pct REAL,
+            core_both_cagr_pct REAL,
             UNIQUE(candidate_id)
         )""")
     # Same sqlite "no ADD COLUMN IF NOT EXISTS" probe-first pattern as ensure_table()
@@ -470,6 +486,26 @@ def ensure_phase4_table(conn):
         conn.execute("ALTER TABLE phase4_results ADD COLUMN trades_resolution TEXT")
     if "second_build_id" not in existing_p4_cols:
         conn.execute("ALTER TABLE phase4_results ADD COLUMN second_build_id INTEGER")
+    # 2026-09-08 Phase5-consolidation, same probe-first ALTER pattern.
+    #
+    # The two `_ungated` columns were briefly written under the unsuffixed names
+    # core_addon_cagr_pct/core_drought_cagr_pct earlier the same day, before the
+    # gated-vs-ungated name collision with candidate_full_review.py was caught in paired
+    # review. RENAME COLUMN (not a fresh ADD) so the real rows already persisted under the
+    # old names keep their values instead of being stranded in a dead column -- sqlite has
+    # supported ALTER TABLE ... RENAME COLUMN since 3.25 (this repo's runtime is 3.37+).
+    # Guarded on "old present AND new absent" so it is a genuine one-time no-op afterwards,
+    # same spirit as the probe-first ADDs around it.
+    for _old, _new in (("core_addon_cagr_pct", "core_addon_cagr_ungated_pct"),
+                       ("core_drought_cagr_pct", "core_drought_cagr_ungated_pct")):
+        if _old in existing_p4_cols and _new not in existing_p4_cols:
+            conn.execute(f"ALTER TABLE phase4_results RENAME COLUMN {_old} TO {_new}")
+            existing_p4_cols.discard(_old)
+            existing_p4_cols.add(_new)
+    for _col in ("core_addon_cagr_ungated_pct", "core_drought_cagr_ungated_pct",
+                 "core_both_cagr_pct"):
+        if _col not in existing_p4_cols:
+            conn.execute(f"ALTER TABLE phase4_results ADD COLUMN {_col} REAL")
 
 
 def get_stored_phase4(conn, candidate_id):
