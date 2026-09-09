@@ -57,9 +57,9 @@ scenario's 3-leg structure):
           closes the leg -- the parent core position is untouched (still
           open, its own separate lifecycle), proving this is leg-scoped
           independent detection, not a lockstep close riding on the parent.
-          => coverage_events['addon_exit_fill'] = 'sl_closed_reconcile'
-             <-- TARGET (the exact result string coverage_registry.py's
-             bad_results list is built to exclude every OTHER value for)
+          => coverage_events['addon_leg_sl_fill_detected'] = 'sl_closed_reconcile'
+             <-- TARGET (this scenario_key is now exclusive to this path,
+             2026-09-08 -- no bad_results disambiguation needed anymore)
           => addon_legs row closed (status='closed', exit_reason=
              'SL_RECONCILED') at the broker's real fill price
           => core parent position (open_positions) still open, untouched
@@ -262,13 +262,12 @@ def run(price=None, verbose=True):
                             rows[2] == node['id'] and rows[3] == MARGIN_ALIAS,
                             f"wl_id={rows[2]} account={rows[3]}"))
 
-    exit_events = db.get_coverage_events(scenario_key="addon_exit_fill")
+    exit_events = db.get_coverage_events(scenario_key="addon_leg_sl_fill_detected")
     sl_reconciled = [e for e in exit_events
                      if e['result'] == 'sl_closed_reconcile' and e['node_id'] == node['id']
                      and f"leg_id={leg_id}" in (e['detail'] or '')]
-    checks.append(Check("addon_exit_fill fired 'sl_closed_reconcile' -- TARGET result, "
-                        "distinct from every lockstep-close result "
-                        "(coverage_registry.py's bad_results list depends on this exact string)",
+    checks.append(Check("addon_leg_sl_fill_detected fired 'sl_closed_reconcile' -- TARGET result, "
+                        "under its own dedicated scenario_key (split from addon_exit_fill, 2026-09-08)",
                         len(sl_reconciled) == 1,
                         f"events={[(e['result'], e['detail']) for e in exit_events]}"))
 
@@ -289,7 +288,7 @@ def run(price=None, verbose=True):
 PROOF_SQL = """
 SELECT al.exit_reason, al.status, al.wl_id, al.account, wl.state,
        (SELECT COUNT(*) FROM open_positions WHERE wl_id = al.wl_id) AS core_still_open,
-       (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='addon_exit_fill'
+       (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='addon_leg_sl_fill_detected'
          AND result='sl_closed_reconcile' AND node_id=al.wl_id) AS sl_reconcile_events
   FROM addon_legs al
   JOIN watch_list wl ON wl.id = al.wl_id

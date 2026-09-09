@@ -3878,7 +3878,7 @@ def check_addon_leg_reconciliation(open_positions):
             fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=leg['sl_order_id'])
             if fill is not None:
                 db.close_addon_leg(leg['id'], fill['price'], datetime.now(), 'SL_RECONCILED')
-                db.log_coverage_event("addon_exit_fill", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                db.log_coverage_event("addon_leg_sl_fill_detected", mode, ticker=ticker, node_id=leg.get('wl_id'),
                                        result="sl_closed_reconcile",
                                        detail=f"leg_id={leg['id']} price={fill['price']:.4f}")
                 _leg_node = db.get_watch_list_node_by_id(leg.get('wl_id'))

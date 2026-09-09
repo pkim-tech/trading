@@ -1540,8 +1540,11 @@ REGISTRY = [
                "entry): the paper node v5-overlay-test-da (wl_id=186/187) was the only thing probing the "
                "stacked drought+addon combination, and individual addon/drought Grid rows above only ever "
                "exercised a node with ONE overlay flag enabled at a time. Deliberately reuses the "
-               "addon_entry_fill scenario_key (same pattern as addon_leg_independent_sl_fill_detection "
-               "reusing addon_exit_fill above) rather than adding a new log_coverage_event call site -- "
+               "addon_entry_fill scenario_key (a real, deliberate scenario_key reuse for a genuine "
+               "combination-of-two-events check -- NOT the same as the fragile shared-key pattern "
+               "addon_leg_independent_sl_fill_detection used to have with addon_exit_fill above, split "
+               "apart 2026-09-08 because THAT sharing was accidental/undisambiguated, not deliberate) "
+               "rather than adding a new log_coverage_event call site -- "
                "this row's own real evidence is the COMBINATION (addon_entry_fill together with a real "
                "drought_entry_placement event for the same node_id in the same test), not a scenario_key "
                "of its own; see offline_coverage for the drought_entry_placement half of the same file. "
@@ -1561,42 +1564,46 @@ REGISTRY = [
          bad_results=[],
          notes="Applies the validated MARGIN_COST_FLAT_PCT haircut (0.04pp) to the leg's pnl_pct -- "
                "missing in the first version (found by review), which was 0.04pp optimistic on every "
-               "leg relative to scripts/stacked_model/add_on.py's validated model. NOTE (2026-08-07): "
-               "this scenario_key is now also logged by the unrelated "
-               "addon_leg_independent_sl_fill_detection row below (result='sl_closed_reconcile') -- a "
-               "live event here does NOT distinguish lockstep-close proof from independent-stop-fill "
-               "proof; check the result value or see that row's own status instead."),
+               "leg relative to scripts/stacked_model/add_on.py's validated model. Split off from the "
+               "addon_leg_independent_sl_fill_detection row's own scenario_key, 2026-09-08 (planner "
+               "dispatch) -- that row now logs its own distinct 'addon_leg_sl_fill_detected' key at its "
+               "real call site (signals_notify.py's check_addon_leg_reconciliation, sl_order_id branch), "
+               "so a coverage_events row here is now unambiguously lockstep-close proof, no result-value "
+               "disambiguation needed."),
     dict(id='addon_leg_independent_sl_fill_detection',
          scenario="An add-on leg's OWN protective stop fills independently (before the parent's "
                   "lockstep exit signal is ever computed) and gets detected/closed via reconciliation, "
                   "not left stuck open",
          code_path="signals_notify.check_addon_leg_reconciliation (new poll of leg['sl_order_id'])",
-         offline_coverage="No dedicated fake_broker test yet -- built same session as "
-                           "sl_order_fills_independent_detection below (same shape, one level down), "
-                           "not separately regression-tested.",
-         check_mechanism='coverage_events', scenario_key='addon_exit_fill',
-         # The code already logs a genuinely distinct result ('sl_closed_reconcile',
-         # signals_notify.py ~2454) for this specific path -- but bad_results was still []
-         # (found by Opus audit, 2026-08-14), so any of the sibling lockstep-close results
-         # ('closed', 'closed_late_reconcile', 'dry_run_closed', all logged under this same
-         # scenario_key) counted as false proof of THIS row's independent-detection path.
-         # paired Opus review (2026-08-14) found this list was incomplete: paper_trading.py's
-         # own add-on-leg lockstep close (paper_trading.py:1584) ALSO logs this scenario_key,
-         # with result=exit_reason (the parent's real exit reason, always one of this
-         # project's small fixed exit-reason vocabulary -- SL/TP/TIME/TRAIL, never a genuine
-         # independent-detection result) -- paper's leg close is ALWAYS lockstep-only per its
-         # own docstring ("an add-on leg NEVER independently triggers its own SL/TRAIL check"),
-         # so all 4 must be excluded too, or a single paper lockstep close could flip this row
-         # to paper-only with zero real independent-detection proof.
-         bad_results=['closed', 'closed_late_reconcile', 'dry_run_closed', 'SL', 'TP', 'TIME', 'TRAIL'],
+         offline_coverage="fake_venue/scenarios_addon_leg_independent_sl_fill_detection.py (built "
+                           "2026-08-15, same shape as sl_order_fills_independent_detection below one "
+                           "level down) + tests/test_fake_venue_addon_leg_independent_sl_fill_detection_"
+                           "scenario.py (added 2026-09-08, paired-review finding -- without a tests/ "
+                           "wrapper asserting get_coverage_events(scenario_key='addon_leg_sl_fill_"
+                           "detected') directly, this row's offline_proof_for() scan credit was NONE "
+                           "despite the fake_venue scenario passing, since that scanner only reads "
+                           "tests/test_*.py, never fake_venue/*.py). No dedicated fake_broker-fixture "
+                           "test (unlike the sl_order_fills_independent_detection sibling, whose credit "
+                           "actually comes from such a test, not its own fake_venue wrapper).",
+         check_mechanism='coverage_events', scenario_key='addon_leg_sl_fill_detected',
+         # Given its own distinct scenario_key, 2026-09-08 (planner dispatch), replacing the
+         # earlier fragile design (shared 'addon_exit_fill' key, disambiguated only by
+         # result='sl_closed_reconcile' vs a growing bad_results exclusion list -- already
+         # missed one real case once, 2026-08-14, when paper_trading.py's own lockstep close
+         # turned out to also log the shared key). The real call site
+         # (signals_notify.py's check_addon_leg_reconciliation sl_order_id branch) now logs
+         # this key exclusively, so any coverage_events row under it is unambiguous
+         # independent-detection proof -- no bad_results filtering needed.
+         bad_results=[],
          notes="New 2026-08-07, same root cause and same review pass as the core-position "
                "sl_order_fills_independent_detection fix -- check_addon_leg_reconciliation only ever "
                "polled leg['exit_order_id'] (an order WE placed in response to the parent's already-"
                "computed lockstep exit), never leg['sl_order_id'] (the leg's own resting stop, "
-               "continuously monitored by the broker independent of our bar-close checks). Shares the "
-               "addon_exit_fill scenario_key with the lockstep-close row above -- distinguish by "
-               "result='sl_closed_reconcile'. No fake_broker regression test written for this specific "
-               "branch (unlike the core-position sibling, which has 5) -- open follow-up."),
+               "continuously monitored by the broker independent of our bar-close checks). Given its "
+               "own scenario_key ('addon_leg_sl_fill_detected'), 2026-09-08 -- no longer shares "
+               "'addon_exit_fill' with the lockstep-close row above. No fake_broker regression test "
+               "written for this specific branch (unlike the core-position sibling, which has 5) -- "
+               "open follow-up."),
     # Real-only control points, added with the real drought/add-on order-
     # placement build (docs/plans/real_order_execution_drought_addon.md,
     # Part 8) -- no paper analogue, since paper never calls schwab_client/
