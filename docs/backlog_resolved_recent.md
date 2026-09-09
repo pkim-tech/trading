@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest] Resolved-as-not-needed 2026-09-08 — island-pooling crowd-out fix + live-node force-seeding both dropped: sweep's actual picks already beat/match live on every ticker checked (HIBL/GDXU/KORU/NUGT/OILU). "Get better, not protect the incumbent." Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved 2026-09-06 — Phase2.5/Phase4 1s-fill-resolution kernel wiring committed: reverified on corrected data, 4 held findings + 2 round-2 paired-review findings (selection-bias, insufficient memory mitigation) fixed, real memory near-miss caught+fixed under a full end-to-end run. Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved 2026-09-06 — `massive_second_derived` double-dividend-adjustment bug root-caused+fixed; all 22 tickers rebuilt+verified clean (0.0000% ratio vs minute leg, was up to ~21% wrong for dividend-paying tickers). Kernel wiring that surfaced this stays paused separately. Full detail: `deep_backlog.md`.

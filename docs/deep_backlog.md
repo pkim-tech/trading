@@ -1,5 +1,35 @@
 # Backlog
 
+## ✅ [backtest] Resolved-as-not-needed 2026-09-08 — island-pooling crowd-out (HIBL/GDXU/KORU/NUGT) and live-node force-seeding both decided against; "get better," not "protect the incumbent"
+
+Real reframe of the same-night crowd-out investigation (GDXU/KORU/NUGT/OILU real live
+nodes missing from v6.5.1's final candidates — see this file's own entries and
+`docs/research_log.md`). Original instinct was to fix the island-pooling selection
+algorithm (top-N per island, or partition islands on more axes like `max_hold_hours`)
+and/or build a live-node force-seeding mechanism so a real live node's exact cell can
+never be silently dropped from a fresh sweep again.
+
+**User's correction, decisive**: neither is actually needed. The sweep doesn't exist to
+preserve/reproduce the exact live configuration — it exists to find better ones. Checked
+directly for all 5 affected tickers (HIBL, KORU, NUGT, GDXU, OILU): in every case, the
+sweep's own actual best current pick is a genuinely strong, safe candidate on its own
+merits (real CAGR/worst_neighbor_cagr numbers checked, not assumed) — regardless of
+whether it happens to match the live node's exact cell. For KORU/HIBL specifically, the
+sweep's picks were independently resimmed and confirmed to beat live on every dimension
+(core/addon/drought/safety), not just plausibly different.
+
+**Conclusion**: losing a live node's exact cell to a genuinely better alternative isn't a
+bug — it's the search working as intended. A within-island selection-granularity fix
+(top-N per island) would have real, uncontrolled cost (multiplying the candidate
+population if partitioned on more axes; a fixed multiplier even with the "top-N, same
+islands" variant) for a problem that isn't actually costing anything. Live-node
+force-seeding would only matter if the organic sweep's own picks were *worse* than live
+for a given ticker — checked, and they aren't, across every ticker investigated. Both
+ideas closed without being built. The real, actionable output of this investigation was
+never a search-algorithm fix — it's that GDXU/HIBL/KORU/NUGT/OILU all have real, good
+replacement-candidate options worth a promotion review, same as any other candidate
+comparison.
+
 ## ✅ [backtest] Resolved 2026-09-06 — Phase2.5/Phase4 1s-fill-resolution kernel wiring: reverified on corrected data, 4 held paired-review findings fixed, round-2 paired review (independent-cold + contextual Opus) found 2 more real bugs (fixed), real memory near-miss caught+fixed under a full end-to-end run
 
 Resumes the item below (data blocker fixed first). Full writeup: `docs/research_log.md`'s

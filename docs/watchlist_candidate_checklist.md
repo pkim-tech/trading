@@ -4,6 +4,21 @@ Run this on any ticker before promoting it to `live` (new candidate, or re-check
 existing one after a macro/regime concern is raised). All checks use only cached hourly
 data + yfinance 5-min bars — no broker/live data needed.
 
+## 0. Live-vs-candidate screening check (added 2026-09-08 — mechanical pre-check, run first)
+Before spending effort on checks 1-18 below: pull the candidate's and the current live
+node's already-EXISTING stored numbers only (`candidate_verification_results`/
+`phase4_results` — never trigger a fresh Phase4 scope recompute for this step, that's
+real, avoidable cost; see `docs/research_log.md`'s 2026-09-08 entry on why a scope-wide
+Phase4 rerun is much more expensive than a single-candidate lookup) — core/addon/drought/
+core_both CAGR + worst_neighbor_cagr, side by side. If the candidate doesn't clearly beat
+live on the numbers already on file, stop here — don't run the rest of the checklist on a
+candidate that isn't actually better. This is a cheap, mechanical screening gate, not a
+judgment call each time — a real script for this should exist under `scripts/` (check
+`scripts/list_scripts.py --grep` first) rather than being re-derived ad hoc per promotion
+review. Numbers used here may be pre-`10f1945`-fix stale for drought specifically (see
+that commit) — note explicitly if that caveat applies to a given comparison rather than
+silently trusting a stale number, but don't block this cheap step on a full refresh.
+
 ## 1. Macro/trend check
 Is the underlying trending hard in one direction right now, independent of the backtest's
 mean-reversion assumption?
