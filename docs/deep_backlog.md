@@ -1,5 +1,84 @@
 # Backlog
 
+## ✅ [live-trading] Resolved 2026-09-08 — real-fill sizing-sanity check added to signals_invariants.py, closes the gap that let trading_incident #17 (UGL ~2x oversized entry) go undetected
+
+Planner dispatch after `trading_incidents.py` incident #17 (real_money_impact=True):
+UGL's core entry (10:32 AM ET, wl_id=246, brokerage) was sized 181sh @ $51.11 =
+$9,251.80 notional vs a correct target of $4,460.64 (~2x oversized) -- caused by the
+`_last_sale_recovery` addon-leg-proceeds-vs-profit double-counting bug fixed in
+commit 8b87283, which landed 7.5h AFTER this entry used the buggy formula. Every
+EXISTING invariant check (`check_starting_notional_within_account_notional_cap` etc.)
+only ever compared the *configured* `starting_notional` against a snapshot -- none of
+them looked at whether a REAL fill's actual notional matched what current sizing logic
+says it should be, so a runtime sizing-CALCULATION bug (as opposed to a config edit)
+was invisible to all of them.
+
+**Built**: `signals_invariants.check_core_entry_notional_matches_sizing` (core AND
+`drought_overlay` entries, both size through the same `_last_sale_recovery` call --
+real incident #15 precedent) and `check_addon_leg_shares_matches_parent` (addon legs
+have NO independent notional formula at all -- traced every real call site,
+`signals_notify.check_addon_trigger_real`/`paper_trading.py` always size a leg to
+EXACTLY its parent core position's own share count, so the correct check is an exact
+share-count match, not a percentage-tolerance comparison -- a deliberate, traced
+deviation from the dispatch's literal "notional target" wording). Both wired into
+`CHECKS`/`run_all()`. Confirmed directly against real production data: the core check
+flags UGL's actual real entry (107.4% deviation vs the corrected target) and nothing
+else, after 2 rounds of paired review tuned the whole-share-rounding-floor logic to
+avoid false positives on small canary/pilot nodes (TMF/FAS) without masking a
+UGL-magnitude bug at a high-price/low-share-count node (the floor is one-sided --
+sizing only ever floors, never rounds up -- and bounded by one share's own price, not
+a flat dollar figure, since legitimate flooring error scales with share price).
+
+**Paired review** (independent-cold + contextual Opus, 2 full rounds with rebuttal
+exchange): round 1 found 2 HIGH + 3 MEDIUM findings, both fixed/addressed:
+- HIGH: `starting_notional_override_once` is unconditionally cleared by
+  `open_position()` in the same transaction as the fill it applies to --
+  recomputing `_last_sale_recovery` after that clear is a GUARANTEED false
+  violation for any real once-bump fill, not a rare edge case. Fixed via a new
+  `_once_consumed_target_for()` that reads the real
+  `starting_notional_override_once_consumed` coverage_event (logged by
+  `open_position()` itself) instead of recomputing. Building this fix surfaced
+  its own real bug (caught before it shipped): `coverage_events.ts` defaults to
+  SQLite's `datetime('now')` (UTC), while `entry_time` is naive local time --
+  compared directly, this silently missed every real match by ~4-5h. Fixed with
+  an explicit UTC-offset correction, verified empirically against the real DB.
+- HIGH: `drought_overlay` entries were excluded from the check's scope entirely,
+  despite sizing through the identical `_last_sale_recovery` call (incident #15)
+  -- the same bug class could recur there completely undetected. Fixed by
+  widening scope to `position_source in ('core', 'drought_overlay')`.
+- MEDIUM (round 2, after the first floor fix): a flat `$200` dollar bound on the
+  rounding floor doesn't scale for a high-priced ticker at low notional (real
+  example found via a live DB query: IVV @ $771/share, QQQ @ $708/share -- one
+  share alone exceeds $200, so legitimate flooring would have been wrongly
+  flagged). Fixed by bounding by one share's own price (`entry_price`) instead
+  of a flat figure -- self-scaling, and still fails safely open for UGL's real
+  ~94-share gap regardless.
+- MEDIUM x2 (documented, not code-fixed, both reviewers agreed proportionate):
+  a `starting_notional_override`/`starting_notional` PERMANENT config edit made
+  while a position is open (independent of any episode closing) can still
+  produce a spurious violation -- no config-history table exists to reconstruct
+  point-in-time state, and this requires a rare, deliberate manual action, unlike
+  the guaranteed-misfire `_once` case above. An addon leg that closes AFTER the
+  checked position opened (`_last_sale_recovery`'s own documented "days later via
+  reconciliation" possibility) can retroactively change an older episode's
+  recovery total -- narrow, accepted as a known residual limitation.
+- Also confirmed correct (both reviewers, independently): the addon-leg
+  exact-share-match design (no independent sizing formula exists to check
+  against), the `parent_position_id` → `parent_trade_log_id` fallback for a leg
+  that outlives its own parent's close, and that `_last_sale_recovery`'s own
+  pre-existing (ticker/strategy/version/window/account, not `wl_id`) matching-key
+  ambiguity is inherited, not introduced here, and out of scope for this fix.
+
+Tests: `tests/test_signals_invariants_sizing_matches_fill.py`, 11 cases covering
+clean entries, the UGL-shaped incident, small-notional rounding, ordinary slippage,
+paper-node exclusion, both addon-leg parent-resolution paths, the once-consumed
+override, drought_overlay scope, and the high-price/low-share-count oversizing case
+the rounding-floor fix specifically had to not mask. All pass; `signals_invariants.py`
+re-run against real production data confirms exactly 1 violation (the real UGL
+incident) and nothing else. `trading_incidents.py` incident #17 resolved via
+`signals_db.resolve_incident(17, ...)` now that this check exists and demonstrably
+catches it.
+
 ## ✅ [backtest] Resolved-as-not-needed 2026-09-08 — island-pooling crowd-out (HIBL/GDXU/KORU/NUGT) and live-node force-seeding both decided against; "get better," not "protect the incumbent"
 
 Real reframe of the same-night crowd-out investigation (GDXU/KORU/NUGT/OILU real live

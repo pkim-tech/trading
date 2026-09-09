@@ -1200,6 +1200,252 @@ def check_live_overlay_missing_validation_link():
     return violations
 
 
+CORE_SIZING_TOLERANCE_PCT = 25.0
+ADDON_LEG_SHARE_TOLERANCE = 0  # legs mirror the core's exact share count -- no legitimate reason to differ
+
+
+def check_core_entry_notional_matches_sizing(tolerance_pct=CORE_SIZING_TOLERANCE_PCT):
+    """Real-fill sizing sanity check -- built 2026-09-08 after trading_incident #17
+    (UGL core entry, 10:32 AM ET, wl_id=246, brokerage: 181sh @ $51.11 = $9,251.80
+    real notional vs its $5,000 starting_notional). Root cause: `_last_sale_recovery`
+    (signals_helpers.py) summed each closed addon_legs row's raw exit proceeds
+    instead of its profit, double-counting the leg's own margin-financed capital and
+    inflating the recovery-based target notional for the next core buy -- fixed in
+    commit 8b87283, 7.5h AFTER this entry used the buggy formula. Every EXISTING
+    invariant check (check_starting_notional_within_account_notional_cap etc.) only
+    ever compares the CONFIGURED starting_notional against a snapshot -- none of them
+    look at what a REAL fill's actual notional was, so a runtime sizing-CALCULATION
+    bug (as opposed to a config edit) was invisible to all of them. This check closes
+    that gap by comparing a real fill's actual notional against what the CURRENT
+    (post-fix) sizing logic would compute for it right now.
+
+    Scope: only currently-OPEN core AND drought_overlay positions (paired-review
+    HIGH finding, 2026-09-08: drought entries size through this SAME
+    `_last_sale_recovery(node)` call, deliberately, since real incident #15 -- an
+    earlier version of this check only looked at position_source='core' and would
+    have missed the identical bug class recurring on a drought entry). Not closed
+    trade_log history, not addon legs (see check_addon_leg_shares_matches_parent
+    for those) -- deliberately, not just for simplicity. `_last_sale_recovery(node)`
+    is a live query against the CURRENT state of trade_log/addon_legs (whatever
+    closed most recently as of the call), not a point-in-time snapshot as of any
+    given entry's own signal time -- for the position that is CURRENTLY open, no
+    later CLOSED EPISODE can have contributed proceeds/profit since it opened
+    (it's still open), so recomputing the trade_log-recovery branch fresh right
+    now reflects the same inputs the sizing call would have seen at real entry
+    time -- for THAT branch specifically.
+
+    NOT a guarantee for every branch, confirmed by paired review (2026-09-08,
+    both independent-cold and contextual Opus, real findings, not fixed by
+    restricting to open positions):
+    - `starting_notional`/`starting_notional_override` (the PERMANENT override)
+      can be edited by a human at any time, independent of any episode closing
+      -- if a node's override was changed AFTER this position's real entry, this
+      check compares the fill against the NEW value and can produce a spurious
+      violation with no real sizing bug. No general fix exists without a config-
+      history table this project doesn't have; accepted as a known, narrow,
+      low-frequency residual risk (an override edit on a node with a real open
+      position is an unusual, deliberate, rare action) rather than over-building.
+    - `_last_sale_recovery`'s own matching key is (ticker, strategy, version,
+      window, account), not `wl_id` (a pre-existing limitation of that function,
+      not introduced here) -- two nodes sharing that tuple could cross-
+      contaminate a recompute. Not currently reachable (no two live nodes share
+      a ticker today, see CLAUDE.md's buy_fill_reconciles_correct_node gap note)
+      but inherited, not newly introduced.
+    - An addon leg tied to an OLDER episode can close AFTER this position opened
+      (`_last_sale_recovery`'s own docstring: "days later via reconciliation"),
+      changing that older episode's total/recency retroactively -- narrow, only
+      matters if that older episode is what this position's OWN sizing actually
+      used, which requires a specific ordering to matter in practice.
+    `starting_notional_override_once` IS handled specially below (see the
+    once-consumed lookup) since it is unconditionally cleared by open_position()
+    at the very fill this check is trying to verify -- recomputing after that
+    clear would ALWAYS diverge from what real sizing used, a guaranteed false
+    positive, not a rare edge case.
+
+    Tolerance (default 25%, per real user direction -- tune down if this proves
+    noisy against ordinary slippage): a real fill's price is NEVER the exact
+    signal-time price used to compute target_notional -- TIME/TRAIL/SL exits don't
+    apply here (this checks ENTRIES), but the entry itself can still be a market
+    buy (gap_resize/ambient) or a worst-case-padded trailing buy that fills better
+    or worse than its target, and `buy_order_sizing`'s own worst-case share-count
+    math (pad_pct/market_pad_pct) means a real fill routinely lands somewhat off
+    target_notional by design, not by bug. Only a deviation clearly outside normal
+    slippage (the UGL incident was ~+108%, roughly double) is flagged.
+
+    Skips: state='paper' nodes (schwab_safety.check_order's real order paths don't
+    apply), and any node/position missing entry_price/shares/wl_id (nothing to
+    check yet, or a synthesized row this doesn't apply to). is_dry_run_sim positions
+    ARE included -- they run the exact same sizing call, just against synthesized
+    fills instead of a real broker order, so the same bug would manifest there too."""
+    violations = []
+    for pos in db.get_open_positions():
+        if pos.get('position_source') not in ('core', 'drought_overlay'):
+            continue
+        entry_price = pos.get('entry_price')
+        shares = pos.get('shares')
+        wl_id = pos.get('wl_id')
+        if not entry_price or not shares or not wl_id:
+            continue
+        node = db.get_watch_list_node_by_id(wl_id)
+        if node is None or node.get('state') == 'paper':
+            continue
+        expected_notional = _once_consumed_target_for(wl_id, pos.get('entry_time'))
+        expected_source = 'starting_notional_override_once (consumed at this exact fill)'
+        if expected_notional is None:
+            try:
+                expected_notional = helpers._last_sale_recovery(node)
+                expected_source = '_last_sale_recovery'
+            except Exception as e:
+                violations.append(
+                    f"{pos['ticker']} (wl_id={wl_id}) -- _last_sale_recovery raised {type(e).__name__}: {e} "
+                    f"while sizing-checking this open position -- treat as a violation until fixed."
+                )
+                continue
+        if not expected_notional:
+            continue
+        real_notional = shares * entry_price
+        # Whole-share rounding floor (found while sanity-checking this against real
+        # data, 2026-09-08, refined after 2 rounds of paired review): sizing always
+        # floors to a whole share count, so at low notional (small canary/pilot
+        # nodes, e.g. $500 target / $178 price = 2.8 shares -> floors to 2, a real,
+        # correct, "29% deviation" that isn't a bug) a pure percentage tolerance
+        # false-positives constantly. ONE-SIDED (real shares must be AT OR BELOW the
+        # expected fractional share count -- sizing floors, it never rounds up, so a
+        # real fill ABOVE expected_shares is never legitimate rounding and must not
+        # be silently skipped) AND bounded by one share's own price (round 2 fix --
+        # a flat $200 dollar bound, like the earlier flat share-count-only floor it
+        # replaced, doesn't scale for a HIGH-priced ticker at low notional: a real
+        # $1,500 node at $771/share correctly floors to 1 share, a legitimate ~$729
+        # gap that a flat $200 bound would have wrongly flagged. Legitimate flooring
+        # error is bounded by ONE share's price by construction, never more, so
+        # that's the real, self-scaling bound -- not an arbitrary flat dollar
+        # figure). UGL's real incident (~94 shares / ~$4,791 off, share_gap deeply
+        # negative) fails the one-sided share_gap>=0 test on its own regardless of
+        # this dollar bound, so this refinement cannot reintroduce that miss.
+        #
+        # NOTE (independent-cold review, round 3): since dollar_gap == share_gap *
+        # entry_price exactly (no independent rounding between the two terms),
+        # `dollar_gap <= entry_price` is mathematically equivalent to `share_gap <=
+        # 1.0` -- it is the binding constraint here, not the `<= 1.5` below (kept
+        # at 1.5 only as an explicit, generous upper bound in share-count terms for
+        # readability; the real effective tolerance for pure floor-rounding is 1
+        # share, confirmed against buy_order_sizing/_reconcile_fill's own floor
+        # arithmetic, which never legitimately produces more than a 1-share gap).
+        expected_shares = expected_notional / entry_price
+        share_gap = expected_shares - shares
+        dollar_gap = abs(real_notional - expected_notional)
+        if 0 <= share_gap <= 1.5 and dollar_gap <= entry_price:
+            continue
+        deviation_pct = dollar_gap / expected_notional * 100
+        if deviation_pct > tolerance_pct:
+            violations.append(
+                f"{pos['ticker']} (wl_id={wl_id}, account={pos.get('account')!r}) open {pos.get('position_source')} "
+                f"position: real fill notional ${real_notional:,.2f} ({shares}sh @ ${entry_price:.4f}) deviates "
+                f"{deviation_pct:.1f}% from the expected target ${expected_notional:,.2f} (source={expected_source}, "
+                f"tolerance={tolerance_pct:.0f}%) -- a sizing-calculation bug, not just ordinary slippage, "
+                f"unless recently explained otherwise."
+            )
+    return violations
+
+
+def _once_consumed_target_for(wl_id, entry_time):
+    """Real once_value from a `starting_notional_override_once_consumed` coverage_
+    event for this exact node/fill, or None if none exists (paired-review HIGH
+    finding, 2026-09-08: `open_position()` unconditionally clears
+    starting_notional_override_once in the SAME transaction as the fill it applies
+    to, so recomputing `_last_sale_recovery(node)` fresh afterward is guaranteed to
+    see the ALREADY-CLEARED state and fall through to a different, typically much
+    lower, target -- a guaranteed false violation for any position genuinely sized
+    via a once-bump, not a rare edge case like the other residual risks documented
+    above. `open_position()` logs this exact event (detail contains the real
+    `once_value` used) at fill time for precisely this auditability -- reusing it
+    here closes the gap instead of trying to reconstruct point-in-time state some
+    other way. Matched by node_id + entry_time proximity (within 5 minutes) since
+    coverage_events has no direct position_id column for this scenario_key."""
+    if entry_time is None:
+        return None
+    import re
+    entry_dt = entry_time if hasattr(entry_time, 'strftime') else datetime.fromisoformat(str(entry_time))
+    # coverage_events.ts defaults to SQLite's datetime('now') -- UTC, naive -- while
+    # entry_time (from datetime.now() throughout signals_db.py) is naive LOCAL time.
+    # Comparing them directly without correcting for this (found while testing this
+    # exact lookup, 2026-09-08) silently misses every real match by a full UTC
+    # offset (~4-5h) -- converts ts to local using the current process's own local
+    # UTC offset (same offset applies to both "now" and any recent event/entry,
+    # since this is same-day real-time data, not a historical DST-boundary lookup).
+    utc_offset = datetime.now().astimezone().utcoffset()
+    for event in db.get_coverage_events(scenario_key="starting_notional_override_once_consumed", limit=500):
+        if event.get('node_id') != wl_id:
+            continue
+        try:
+            event_dt = datetime.fromisoformat(event['ts']) + utc_offset
+        except (ValueError, TypeError):
+            continue
+        if abs((event_dt - entry_dt).total_seconds()) > 300:
+            continue
+        m = re.search(r'once_value=\$([\d,]+\.\d+)', event.get('detail') or '')
+        if m:
+            return float(m.group(1).replace(',', ''))
+    return None
+
+
+def check_addon_leg_shares_matches_parent(share_tolerance=ADDON_LEG_SHARE_TOLERANCE):
+    """Real-fill sizing sanity check for add-on legs, sibling to
+    check_core_entry_notional_matches_sizing above (same trading_incident #17
+    motivation). An add-on leg is NOT independently sized off any notional
+    target -- traced directly, every real call site (signals_notify.
+    check_addon_trigger_real's `shares = int(pos['shares'])`, and paper_trading.py's
+    matching `shares=pos['shares']`) places the leg for EXACTLY the parent core
+    position's own share count, no separate formula, no partial-fill/reduced-size
+    path anywhere in this codebase (schwab_safety's is_addon_leg exemption is a
+    hard allow/block gate, never a resizing step). So the correct comparison
+    baseline here is an EXACT share-count match against the parent, not a
+    notional-with-tolerance comparison like the core check -- confirmed by tracing
+    the formula, not assumed (see this project's Review-Gate Persistence Rule: a
+    wrong assumption here would misfire in the wrong direction, since a real
+    tolerance-pct check would treat every non-round-share-count leg as a false
+    'small deviation' pass instead of the exact-match violation it actually is).
+
+    Scope: real (entry_status='filled') addon_legs rows only -- 'placed'/'abandoned'
+    have no real fill to check yet. Resolves the parent's shares via
+    parent_position_id (still-open core) first, falling back to parent_trade_log_id
+    (closed core) -- a leg can legitimately outlive its own parent's close
+    (independent detection/reconciliation) and still needs a real parent share
+    count to compare against either way."""
+    violations = []
+    with db._conn() as c:
+        legs = [dict(r) for r in c.execute(
+            "SELECT * FROM addon_legs WHERE entry_status='filled'")]
+    for leg in legs:
+        node = db.get_watch_list_node_by_id(leg.get('wl_id'))
+        if node is None or node.get('state') == 'paper':
+            continue
+        leg_shares = leg.get('shares')
+        if not leg_shares:
+            continue
+        parent_shares = None
+        with db._conn() as c:
+            if leg.get('parent_position_id'):
+                row = c.execute("SELECT shares FROM open_positions WHERE id=?",
+                                 (leg['parent_position_id'],)).fetchone()
+                parent_shares = row['shares'] if row else None
+            if parent_shares is None and leg.get('parent_trade_log_id'):
+                row = c.execute("SELECT shares FROM trade_log WHERE id=?",
+                                 (leg['parent_trade_log_id'],)).fetchone()
+                parent_shares = row['shares'] if row else None
+        if parent_shares is None:
+            continue
+        if abs(leg_shares - parent_shares) > share_tolerance:
+            violations.append(
+                f"{leg['ticker']} (wl_id={leg.get('wl_id')}, account={leg.get('account')!r}) addon_legs "
+                f"id={leg['id']}: filled {leg_shares}sh vs parent core position's {parent_shares}sh -- "
+                f"add-on legs are supposed to mirror the parent's share count exactly, this is a real "
+                f"sizing mismatch, not ordinary slippage (price, not share count, is where slippage "
+                f"legitimately shows up for this leg)."
+            )
+    return violations
+
+
 CHECKS = [
     check_paper_position_on_non_paper_node,
     check_live_trailing_exit_automation_scope,
@@ -1218,6 +1464,8 @@ CHECKS = [
     check_addon_drought_live_nodes_have_coherent_account_type,
     check_all_account_values_are_known_aliases,
     check_market_data_freshness,
+    check_core_entry_notional_matches_sizing,
+    check_addon_leg_shares_matches_parent,
 ]
 
 # DATA_FRESHNESS_CHECKS: deliberately NOT in CHECKS/run_all() (2026-08-28,
