@@ -1,34 +1,61 @@
-"""Read-only canary: does Schwab's get_quote return usable pre-market data?
+"""Read-only canary: is Schwab's get_quote (or Massive's live minute-bar API)
+usable pre-market, compared against yfinance?
 
 Built 2026-09-10 per planner-session backlog item: active_signals.py's entry/
 signal-check price path is pure yfinance with no fallback, while the exit/
 reconcile path (schwab_client.get_current_price) already does
 Schwab-primary/yfinance-fallback. Before scoping a fix we need real evidence
-of whether Schwab's quote is even valid pre-market -- get_current_price's
-except block is silent (schwab_client.py:1582-1584) so there's no historical
-log evidence either way.
+of whether Schwab's quote (or Massive's live API) is even valid pre-market --
+get_current_price's except block is silent (schwab_client.py:1582-1584) so no
+historical log evidence exists either way.
 
-Polls every ticker currently state IN ('live','paper') in watch_list, once
-per POLL_INTERVAL_SECONDS, logging Schwab's raw quote/extended fields plus a
-yfinance comparison price to a CSV. Never places orders, never posts Slack,
-never modifies any DB table -- observability only.
+Single-pass mode (changed 2026-09-10, same evening): one invocation = one poll
+round across all three sources (Schwab raw quote, yfinance fast_info, Massive
+latest-minute-bar) for every live/paper watch_list ticker, then exit. Meant to
+be driven externally via crontab (every 30 min, midnight-8:30am ET), not an
+internal sleep loop.
 
-Usage: nohup .venv/bin/python scripts/check_schwab_premarket_quote_validity.py &
-Meant to be launched manually pre-market; not a cron job, not daemon-linked.
+Massive query mirrors the request shape of
+.claude/worktrees/agent-a47e2b4b97765997b/scripts/fetch_massive_minute_data.py's
+fetch_ticker (MASSIVE_API_KEY via .env), narrowed to a single today's-date
+range query, taking the latest bar in the response.
+
+Never places orders, never posts Slack, never modifies any DB table --
+observability only.
+
+Usage: .venv/bin/python scripts/check_schwab_premarket_quote_validity.py
 """
 import csv
+import os
 import sqlite3
 import sys
-import time
-from datetime import datetime, time as dtime
+from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import requests
+from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import schwab_client
 import signals_config as cfg
 
-POLL_INTERVAL_SECONDS = 60
-MARKET_OPEN_ET = dtime(9, 33)  # 9:30 + a few minutes buffer
+load_dotenv()
+
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
 ET = ZoneInfo("America/New_York")
+OUT_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+FIELDNAMES = [
+    "poll_time", "ticker",
+    "schwab_quote_lastPrice", "schwab_quote_tradeTime",
+    "schwab_quote_bidPrice", "schwab_quote_askPrice",
+    "schwab_extended_lastPrice", "schwab_extended_tradeTime",
+    "yfinance_last_price",
+    "massive_latest_bar_timestamp", "massive_latest_bar_close",
+    "massive_result_count",
+    "schwab_error", "yfinance_error", "massive_error",
+]
 
 
 def get_watchlist_tickers() -> list:
@@ -42,20 +69,39 @@ def get_watchlist_tickers() -> list:
     return sorted(r[0] for r in rows)
 
 
+def fetch_massive_latest_bar(ticker: str) -> dict:
+    """Latest minute bar for `ticker` today, mirroring fetch_massive_minute_data.py's
+    fetch_ticker request shape but narrowed to today's date, single call, no pagination."""
+    result = {"timestamp": None, "close": None, "result_count": None, "error": None}
+    if not MASSIVE_API_KEY:
+        result["error"] = "MASSIVE_API_KEY not set in .env"
+        return result
+    today = date.today().isoformat()
+    url = f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/minute/{today}/{today}"
+    params = {"limit": 50000, "sort": "desc", "adjusted": "true", "apiKey": MASSIVE_API_KEY}
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        if resp.status_code != 200:
+            result["error"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            return result
+        data = resp.json()
+        results = data.get("results", [])
+        result["result_count"] = len(results)
+        if results:
+            latest = results[0]
+            result["timestamp"] = datetime.fromtimestamp(
+                latest["t"] / 1000, tz=ZoneInfo("UTC")
+            ).astimezone(ET).isoformat()
+            result["close"] = latest.get("c")
+    except Exception as e:
+        result["error"] = repr(e)
+    return result
+
+
 def poll_ticker(ticker: str) -> dict:
-    row = {
-        "poll_time": datetime.now(ET).isoformat(),
-        "ticker": ticker,
-        "schwab_quote_lastPrice": None,
-        "schwab_quote_tradeTime": None,
-        "schwab_quote_bidPrice": None,
-        "schwab_quote_askPrice": None,
-        "schwab_extended_lastPrice": None,
-        "schwab_extended_tradeTime": None,
-        "yfinance_last_price": None,
-        "schwab_error": None,
-        "yfinance_error": None,
-    }
+    row = {k: None for k in FIELDNAMES}
+    row["poll_time"] = datetime.now(ET).isoformat()
+    row["ticker"] = ticker
 
     try:
         r = schwab_client._get_client().get_quote(ticker)
@@ -78,6 +124,12 @@ def poll_ticker(ticker: str) -> dict:
     except Exception as e:
         row["yfinance_error"] = repr(e)
 
+    massive = fetch_massive_latest_bar(ticker)
+    row["massive_latest_bar_timestamp"] = massive["timestamp"]
+    row["massive_latest_bar_close"] = massive["close"]
+    row["massive_result_count"] = massive["result_count"]
+    row["massive_error"] = massive["error"]
+
     return row
 
 
@@ -88,34 +140,20 @@ def main():
         return
 
     today = datetime.now(ET).strftime("%Y%m%d")
-    out_path = f"logs/schwab_premarket_canary_{today}.csv"
+    out_path = OUT_DIR / f"schwab_premarket_canary_{today}.csv"
+    write_header = not out_path.exists()
 
-    print(f"Polling {len(tickers)} tickers ({tickers}) every {POLL_INTERVAL_SECONDS}s -> {out_path}")
-    print(f"Will stop once ET time passes {MARKET_OPEN_ET}.")
+    print(f"Single-pass poll of {len(tickers)} tickers ({tickers}) -> {out_path}")
 
-    write_header = True
-    poll_count = 0
     with open(out_path, "a", newline="") as f:
-        writer = None
-        while True:
-            now_et = datetime.now(ET)
-            for ticker in tickers:
-                row = poll_ticker(ticker)
-                if writer is None:
-                    writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-                    if write_header:
-                        writer.writeheader()
-                        write_header = False
-                writer.writerow(row)
-            f.flush()
-            poll_count += 1
-            print(f"[{now_et.isoformat()}] poll #{poll_count} done for {len(tickers)} tickers")
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        for ticker in tickers:
+            row = poll_ticker(ticker)
+            writer.writerow(row)
 
-            if now_et.time() >= MARKET_OPEN_ET:
-                print(f"Reached {MARKET_OPEN_ET} ET -- stopping.")
-                break
-
-            time.sleep(POLL_INTERVAL_SECONDS)
+    print(f"Done: {len(tickers)} rows appended.")
 
 
 if __name__ == "__main__":
