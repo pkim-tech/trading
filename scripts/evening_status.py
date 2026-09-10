@@ -674,8 +674,23 @@ def _part2_daily_sweep(nodes, node_state):
         if take_profit is not None:
             tp_price = entry_price * (1 + take_profit / 100)
             if cur >= tp_price:
-                flags.append(f"cur ${cur:.4f} >= TP trigger ${tp_price:.4f} ({take_profit}%) -- "
-                              f"should already have taken profit")
+                if strategies.uses_arm_trail_exit(n['strategy']):
+                    # take_profit is an ARM threshold for these strategies (crossing it
+                    # starts trailing, it's never a direct sell trigger -- see
+                    # TrailingExitZScoreBreakout/TrailingBothZScoreBreakout.check_exit in
+                    # strategies.py). Confirmed live 2026-09-08: AGQ (TrailingExit) was
+                    # false-flagged here as "should already have taken profit" while
+                    # correctly showing ARMED/trailing in Part 4 of the same run. Only a
+                    # real problem if it crossed the arm trigger but trail_state still
+                    # shows not-armed.
+                    trailing = (real_position.get('trail_state') or {}).get('trailing')
+                    if not trailing:
+                        flags.append(f"cur ${cur:.4f} >= arm trigger ${tp_price:.4f} "
+                                      f"({take_profit}%) -- should already be ARMED "
+                                      f"(trailing) but trail_state shows not trailing")
+                else:
+                    flags.append(f"cur ${cur:.4f} >= TP trigger ${tp_price:.4f} ({take_profit}%) -- "
+                                  f"should already have taken profit")
         max_hold_hours = real_position.get('max_hold_hours')
         if max_hold_hours is not None:
             try:
