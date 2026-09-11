@@ -153,6 +153,50 @@ and if a campaign is already running and needs to change, say so and let the
 user decide whether to interrupt it -- don't kill or relaunch sweep
 processes unilaterally.
 
+## Stage 6 -- post-campaign spot-check (lightweight, run after Stage 4 completes)
+
+Distinct from Stages 1-5 (which validate a *code* change before trusting a
+campaign's numbers): this stage validates that a *completed* campaign's
+core/add-on/drought math has no calculation drift, independent of whether
+any kernel code changed. Cheap (minutes, not hours) -- run it whenever you
+want confidence in a campaign's numbers, not just after a kernel edit.
+
+1. Pick a real, `phase4_checked_at`-populated finalist node from the
+   campaign (`candidate_nodes` joined to `phase4_results` on
+   `candidate_id`) -- prefer one whose `cache/research/second_data/
+   {ticker}_1s.csv` file is small (`ls -la` first; sizes range ~17MB-2.7GB
+   across tickers) if a sweep worker pool is running concurrently, since
+   the 1-second CSV load is what can OOM-contend with it (happened once,
+   background job killed by the low-memory safeguard, 2026-09-11).
+2. Run `scripts/sim_1s_vs_1m_groundtruth.py`'s `compare_1s_vs_1m()` (core
+   trades only) and/or `scripts/sim_1s_vs_1m_groundtruth_overlays.py
+   --overlays` (adds add-on/drought, reusing the real
+   `backtester.apply_addon_overlay_ground_truth`/
+   `simulate_drought_overlay_ground_truth` functions on the independently
+   re-simulated 1s trade list) against that node's exact real params.
+3. Diff the printed 1s-resolution numbers against that node's own
+   `phase4_results` row: `check8_compounded_pct` (core), `addon_cagr_pct`/
+   `core_addon_cagr_ungated_pct` (add-on), `drought_compounded_pct`/
+   `drought_combined_compounded_pct` (drought). An exact match confirms no
+   calculation drift entered the campaign between whatever code version
+   produced `phase4_results` and today's independent re-simulation.
+   Compare against `phase4_results`, not `candidate_nodes.trades`/
+   `phase4_checklist_json` -- those are the earlier minute-resolution
+   Phase1/2 numbers, a different (by-design) resolution tier from Phase4's
+   1s-canonical recheck, and will legitimately disagree.
+4. If you also want a real triple-stack (`core_both_cagr_pct`-equivalent)
+   number for a node that has no `phase4_results` row (e.g. an older
+   live-vintage pick predating Phase4), reuse
+   `run_optimization_sweep._stacked_overlay_cagrs_gt(gt_trades, drought,
+   drought_ie=None, years)` directly on the same independently-simulated
+   trade list + drought dict from step 2, rather than hand-rolling the
+   gating logic -- see `docs/research_log.md`'s 2026-09-11 entry for a
+   worked example (SOXL/KORU, confirmed exact matches; one real stale-gate
+   bug found and fixed in `sim_1s_vs_1m_groundtruth_overlays.py`'s
+   `report_overlays()`, which still hardcoded a TrailingBoth-only
+   drought-overlay skip -- generalized to `strategies.uses_arm_trail_exit`,
+   matching `phase5_second_level_overlay_check.py`'s existing fix).
+
 ## Gotchas already found and fixed
 
 - `TrailingBothZScoreBreakout`'s swept "stop_loss" grid axis actually

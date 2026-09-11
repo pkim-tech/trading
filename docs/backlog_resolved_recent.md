@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Investigated-didn't-pan-out 2026-09-11 — concurrent multi-group dispatch for Phase4's addon-cliff-safety check: predicted ~4x, real measurement showed it's SLOWER (8.3s→10.3s) due to per-executor overhead multiplying with pool count; not committed, existing 1.75-1.8x fix stands. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-09-11 — Phase4's addon-cliff-safety check parallelized (`5b74587`), restoring parallelism lost when Phase5 got folded in 2026-09-08; ~1.75-1.8x speedup (25.4s→14.5s, 27 real candidates), zero mismatches. Paired review found+fixed 3 real bugs (coordinate-key mismatch, missed 2nd nested-pool site, wrong-consumer force-serialization) + reverted a wrong-kernel numba warmup regression. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-11 — Phase2.5-cliffbox dispatch grouped by (window,z) to stop per-process second-resolution mprep cache thrashing: ~78x throughput (151 cells/sec vs. live job's own 1.94 cells/sec baseline), ported from verify_v651_cliffsafety_1s_timing.py's existing fix (never applied to the real production path before). Paired review: no HIGH/MEDIUM findings. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-09-11 — live fail_counts visibility added to Phase2.5 dispatch progress bar (`510883c`); paired review found the first-draft fix wouldn't have caught a fast-failing stage (mininterval too coarse), fixed to render on each status's first occurrence + a loud proportional failure-rate line. Full detail: `deep_backlog.md`.

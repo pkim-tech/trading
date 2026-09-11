@@ -171,6 +171,27 @@ here.
     touching a gated file, anything genuinely ambiguous) — don't make every
     step a checkpoint by default.
 
+11. **Require worktree isolation in the dispatch prompt itself, not as an
+    afterthought.** Real near-miss, 2026-09-11: dispatched file-editing work
+    to coder3/coder4 for concurrent tasks while this session was itself
+    actively editing `docs/backlog_cache.md`/`deep_backlog.md`/
+    `backlog_resolved_recent.md` — none of the 4 dispatch prompts that night
+    included a worktree-isolation instruction, so both peers worked directly
+    on `main`, the same shared tree. When coder3 ran `git stash` to back out
+    its own uncommitted code after a negative result, the stash swept up this
+    session's own uncommitted doc edits along with it — recovered cleanly via
+    `git diff stash@{0}^ stash@{0} -- <file>` (the stash bundles everything,
+    nothing was actually deleted), but a `git stash drop`/`pop`-gone-wrong on
+    either side could have lost real work permanently. This is on the
+    dispatcher, not the peer — I write the dispatch prompt, so the fix is
+    mine to make, not something to hope the peer infers from the repo's
+    existing worktree pattern (confirmed 28 old worktrees already exist from
+    past dispatches — the mechanism was available, just not requested). State
+    explicitly, in the SAME message as the review-gate/background-execution
+    instructions: work in an isolated worktree (`EnterWorktree` or
+    equivalent) for any file-editing dispatch that will run concurrently with
+    continued activity in this session.
+
 ## Clearing a peer session
 
 Two safe-to-clear states — don't conflate them:

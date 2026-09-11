@@ -695,14 +695,15 @@ def report_overlays(label, trades, ticker, dfh, node):
               f"(blended return < -100%) -- compounding above may be poisoned (see "
               f"apply_addon_overlay_ground_truth's own docstring)")
 
-    # Still hardcoded to TrailingBoth only (unlike phase5_second_level_overlay_check.py's
-    # overlay_cagrs, generalized 2026-09-02 via strategies.uses_arm_trail_exit -- see
-    # backtester.simulate_drought_overlay_ground_truth's own docstring) -- this caller's own
-    # generalization is a separate, explicitly-queued follow-up item, not done here.
-    if node["strategy"] != "TrailingBothZScoreBreakout":
-        print(f"\n--- {label}: drought overlay -- SKIPPED ({node['strategy']} not yet wired "
-              f"up here -- this specific caller still hardcodes TrailingBoth-only, unlike "
-              f"phase5_second_level_overlay_check.py) ---")
+    # Generalized to match phase5_second_level_overlay_check.py's overlay_cagrs (2026-09-02
+    # fix, backtester.simulate_drought_overlay_ground_truth's own docstring): gated on the
+    # capability flag strategies.uses_arm_trail_exit, not a TrailingBoth-only strategy-name
+    # allowlist -- node["arm_pct"]/node["trail_sell_pct"] are already the correct real
+    # values for whichever strategy this node is, so no per-strategy mapping is needed here.
+    import strategies
+    if not strategies.uses_arm_trail_exit(node["strategy"]):
+        print(f"\n--- {label}: drought overlay -- SKIPPED ({node['strategy']} has no "
+              f"arm/trail exit machinery, per strategies.uses_arm_trail_exit) ---")
         return
 
     print(f"\n--- {label}: drought overlay ---")
