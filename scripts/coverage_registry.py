@@ -70,6 +70,7 @@ from scripts.coverage_check import _check_trade_lifecycle, _is_trading_day
 
 DB_PATH = "./cache/live/trading_live.db"
 _TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
+_FAKE_VENUE_DIR = Path(__file__).resolve().parent.parent / "fake_venue"
 
 REGISTRY = [
     dict(id='pre_action_state_verification',
@@ -2234,9 +2235,18 @@ _OFFLINE_PROOF_CACHE = None
 
 
 def _scan_offline_proof():
-    """Greps every tests/test_*.py file once (memoized per process -- test files
-    don't change mid-run) and returns (event_asserted, mentioned) -- sets of
-    scenario_key strings. See module docstring for what each means.
+    """Greps every tests/test_*.py AND fake_venue/scenarios_*.py file once
+    (memoized per process -- these files don't change mid-run) and returns
+    (event_asserted, mentioned) -- sets of scenario_key strings. See module
+    docstring for what each means.
+
+    fake_venue/ added 2026-09-10 (found via the drought_handoff_precondition_blocked
+    row's own notes, and independently flagged inline on the
+    addon_leg_independent_sl_fill_detection row 2026-09-08): scanning only tests/
+    made a real fake_venue scenario that directly asserts
+    get_coverage_events(scenario_key=...) -- e.g. fake_venue/scenarios_drought_handoff.py's
+    Node D check -- read as zero offline proof, a false negative, since the only prior
+    fix was adding a tests/ wrapper file per row rather than fixing the scanner itself.
 
     Both 'event-asserted' and 'mentioned' require an exact quoted match
     ('key' or "key"), not a bare substring -- found by Opus review 2026-07-26
@@ -2249,12 +2259,12 @@ def _scan_offline_proof():
         return _OFFLINE_PROOF_CACHE
     all_keys = {r['scenario_key'] for r in REGISTRY if r.get('scenario_key')}
     event_asserted, mentioned = set(), set()
-    if not _TESTS_DIR.is_dir():
-        _OFFLINE_PROOF_CACHE = (event_asserted, mentioned)
-        return _OFFLINE_PROOF_CACHE
-    for path in sorted(_TESTS_DIR.glob("test_*.py")):
-        if path.name in _INFRA_TEST_FILES:
-            continue
+    paths = []
+    if _TESTS_DIR.is_dir():
+        paths += [p for p in sorted(_TESTS_DIR.glob("test_*.py")) if p.name not in _INFRA_TEST_FILES]
+    if _FAKE_VENUE_DIR.is_dir():
+        paths += sorted(_FAKE_VENUE_DIR.glob("scenarios_*.py"))
+    for path in paths:
         text = path.read_text()
         for m in _EVENT_ASSERTED_RE.finditer(text):
             if m.group(1) in all_keys:
@@ -2300,13 +2310,14 @@ def offline_proof_for(scenario_key, mode_filter=None):
 
 def _mode_filter_match(scenario_key, mode_filter):
     """For a mode_filter-scoped row, only credit a match found in a test file
-    that also mentions the mode_filter word (quoted, or in the filename) --
-    see offline_proof_for's docstring."""
-    if not _TESTS_DIR.is_dir():
-        return False
-    for path in sorted(_TESTS_DIR.glob("test_*.py")):
-        if path.name in _INFRA_TEST_FILES:
-            continue
+    or fake_venue scenario file that also mentions the mode_filter word
+    (quoted, or in the filename) -- see offline_proof_for's docstring."""
+    paths = []
+    if _TESTS_DIR.is_dir():
+        paths += [p for p in sorted(_TESTS_DIR.glob("test_*.py")) if p.name not in _INFRA_TEST_FILES]
+    if _FAKE_VENUE_DIR.is_dir():
+        paths += sorted(_FAKE_VENUE_DIR.glob("scenarios_*.py"))
+    for path in paths:
         text = path.read_text()
         if not (_EVENT_ASSERTED_RE.search(text) and scenario_key in text) and not _quoted(scenario_key).search(text):
             continue
