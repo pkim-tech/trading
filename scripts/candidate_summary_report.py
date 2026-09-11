@@ -908,7 +908,18 @@ def gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl
     return best_safe_node(df, min_alpha=min_alpha, metric=metric)
 
 
-def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_window=None):
+def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_window=None,
+                       addon_cliff_workers=6):
+    """addon_cliff_workers (2026-09-11, paired-review HIGH finding -- contextual Opus
+    review, both independent-cold and contextual converged on the underlying bug): the
+    nesting-avoidance override belongs at the CALL SITE that's actually nested inside an
+    outer pool (_run_one_gt_scope_worker, itself a run_gt_mode ProcessPoolExecutor
+    worker), NOT hardcoded inside this shared function -- run_candidate_nodes_campaign_
+    verification.py also calls this function, in a fully serial loop with NO outer pool
+    at all, and a hardcoded workers=1 here would have silently starved that real,
+    primary phase4_results-persisting consumer of the entire parallelization fix. Default
+    6 (parallel ON) so every caller except the one that's actually nested gets the real
+    speedup with zero code change required."""
     """Real per-candidate GT rows for one scope, matching GT_COLUMN_DEFS. A
     scope whose Phase1/2-GT campaign isn't complete yet, or whose
     build_candidate_report_ground_truth call fails (e.g. the in-progress
@@ -1087,7 +1098,13 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             report = build_candidate_report_ground_truth(
                 ticker, strategy, version, hp, start_date=win_start, end_date=win_end,
                 fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source,
-                candidates_override=candidates if grid_window is not None else None)
+                candidates_override=candidates if grid_window is not None else None,
+                # addon_cliff_workers threaded straight through from gt_rows_for_scope's
+                # own param (2026-09-11 paired-review HIGH finding fix -- the nesting-
+                # avoidance override moved OUT of this shared function and into whichever
+                # real call site is actually nested inside an outer pool; see that
+                # param's own docstring).
+                addon_cliff_workers=addon_cliff_workers)
         except Exception as e:
             # Broad on purpose -- the in-progress backtester.py drought-overlay fix could
             # legitimately fail with any exception shape while it's mid-fix, not just
@@ -1454,8 +1471,25 @@ def _run_one_gt_scope_worker(db_path, ticker, strategy, version, entry_timing, f
             else:
                 print("  [top_safe_nodes cross-check] skipped -- candidate_nodes-sourced scope, "
                       "no backtest_cache equivalent.")
+            # addon_cliff_workers=1 (2026-09-11, real regression fix in
+            # run_optimization_sweep.py -- paired-review HIGH finding fix, moved here
+            # from inside gt_rows_for_scope itself after both an independent-cold and a
+            # contextual Opus review independently converged on the same underlying bug:
+            # a hardcoded override inside the shared function would have also silently
+            # starved run_candidate_nodes_campaign_verification.py's own fully-serial
+            # call to gt_rows_for_scope, the real primary phase4_results-persisting
+            # consumer, of the whole fix). THIS worker function is the one actually
+            # nested inside run_gt_mode's own ProcessPoolExecutor (--workers, default 4)
+            # -- letting Phase4's new default (6) apply here too would nest a 6-worker
+            # pool inside each outer worker (up to 24 processes at once, each
+            # independently loading its own private copy of this ticker's hourly/
+            # minute/second dataframes -- the exact per-worker memory duplication
+            # bench_phase1_phase2_inmemory.py's own preload-before-fork fix eliminated
+            # for the analogous Phase2.5 path). The real parallelism this fix restores
+            # still applies -- just at the scope level this call site already has, not
+            # a second nested level.
             rows = gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl,
-                                      grid_window=grid_window)
+                                      grid_window=grid_window, addon_cliff_workers=1)
         except Exception as e:
             error = e
         finally:

@@ -1715,8 +1715,21 @@ def _gt_alpha_resolutions(conn, ticker, strategy, version, entry_timing, fixed_s
 
 
 def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl, vol_gate=DEFAULT_VOL_GATE,
-                         candidates_override=None):
-    """candidates_override (2026-09-01, research-session dispatch): passed straight through
+                         candidates_override=None, addon_cliff_workers=6):
+    """addon_cliff_workers (2026-09-11, paired-review HIGH finding -- independent-cold
+    Opus review): threaded straight through to build_candidate_report_ground_truth's own
+    param below. Default 6 (parallel ON, the real Phase4 regression fix) is safe for
+    every caller of this function EXCEPT candidate_full_review_two_tab.py's own
+    _full_review_worker, which runs inside an outer ProcessPoolExecutor
+    (_full_review_rows_for_curated's max_workers>1 path) -- that one caller explicitly
+    passes 1 to avoid nesting a 6-worker pool inside each outer worker (the exact per-
+    worker memory-duplication failure bench_phase1_phase2_inmemory.py's own preload-
+    before-fork fix eliminated for the analogous Phase2.5 path earlier the same night).
+    Every other caller (build_v6_promotion_combined_report.py, sweep_canary.py, this
+    file's own two serial call sites, and _full_review_rows_for_curated's own
+    max_workers<=1 serial path) has no outer pool and gets the real speedup for free.
+
+    candidates_override (2026-09-01, research-session dispatch): passed straight through
     to build_candidate_report_ground_truth's own candidates_override param -- lets a caller
     feed a candidate_nodes-sourced candidate list (scripts/phase4_candidate_nodes_resolver.py's
     derive_phase25_candidates_from_candidate_nodes) for a campaign the in-memory sweep
@@ -1789,7 +1802,8 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
             report = build_candidate_report_ground_truth(
                 ticker, strategy, version, hp, start_date=win_start, end_date=win_end,
                 fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source,
-                candidates_override=candidates_override)
+                candidates_override=candidates_override,
+                addon_cliff_workers=addon_cliff_workers)
         except Exception as e:
             import traceback
             print(f"  [GT full review] {ticker}/{strategy}/{version}: build_candidate_report_ground_truth "

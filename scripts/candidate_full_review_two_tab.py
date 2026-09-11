@@ -981,7 +981,17 @@ def _full_review_worker(payload):
     group's full-checklist rows in a fresh process with its OWN sqlite connection (a live
     sqlite3.Connection can't cross a process boundary). Returns the same flattened,
     GT_SKIP_COLUMNS-labeled row shape the serial path returns, plus any missing node_ids,
-    so the parent's result handling doesn't care which path ran."""
+    so the parent's result handling doesn't care which path ran.
+
+    addon_cliff_workers=1 (2026-09-11, paired-review HIGH finding -- independent-cold
+    Opus review, against run_optimization_sweep.py's Phase4 parallelization fix landing
+    the same night): THIS function is the one real nested case -- it already runs inside
+    an outer ProcessPoolExecutor (_full_review_rows_for_curated's max_workers>1 path
+    below) -- gt_full_review_rows' own new default (6, parallel ON) would otherwise nest
+    a second 6-worker pool inside each outer worker, the exact per-worker memory-
+    duplication failure bench_phase1_phase2_inmemory.py's own preload-before-fork fix
+    eliminated for the analogous Phase2.5 path. The real parallelism the fix restores
+    still applies at the outer (scope-group) level this function already has."""
     db_path, version, vol_gate, ticker, strategy, entry_timing, fixed_sl, window, ids = payload
     conn = sqlite3.connect(db_path, timeout=60.0)
     try:
@@ -994,7 +1004,8 @@ def _full_review_worker(payload):
         if not override:
             return [], missing
         out_rows = gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
-                                        vol_gate=vol_gate, candidates_override=override)
+                                        vol_gate=vol_gate, candidates_override=override,
+                                        addon_cliff_workers=1)
     finally:
         conn.close()
     csv_rows = []

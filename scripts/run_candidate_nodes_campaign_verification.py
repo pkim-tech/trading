@@ -87,7 +87,7 @@ def _phase4_fields_from_row(row):
     }
 
 
-def run_phase4(ticker, version, window, data_source):
+def run_phase4(ticker, version, window, data_source, addon_cliff_workers=6):
     print(f"\n{'='*100}\nPHASE 4 -- {ticker} / {version} / window={window}\n{'='*100}", flush=True)
     t0 = time.monotonic()
     from phase4_candidate_nodes_resolver import discover_candidate_nodes_scopes
@@ -181,6 +181,7 @@ def run_phase4(ticker, version, window, data_source):
             continue
         try:
             scope_rows = gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl,
+                                            addon_cliff_workers=addon_cliff_workers,
                                             grid_window=window)
         except Exception as e:
             print(f"  UNEXPECTED error on this scope, skipping: {e}")
@@ -249,7 +250,16 @@ def main():
     # if "phase3" not in args.skip:
     #     run_phase3(args.ticker, args.version, args.window, args.data_source)
     if "phase4" not in args.skip:
-        run_phase4(args.ticker, args.version, args.window, args.data_source)
+        # addon_cliff_workers=args.workers (2026-09-11, real regression fix in
+        # run_optimization_sweep.py -- see gt_rows_for_scope's own addon_cliff_workers
+        # docstring): this script's own --workers flag (already existed, previously only
+        # threaded into the now-disabled run_phase5 subprocess call below) now also
+        # controls Phase4's own real ProcessPoolExecutor -- this is the fully-serial,
+        # non-nested caller both the independent-cold and contextual paired reviews
+        # flagged as the real primary phase4_results-persisting consumer that would
+        # otherwise have been silently starved of the whole fix.
+        run_phase4(args.ticker, args.version, args.window, args.data_source,
+                   addon_cliff_workers=args.workers)
     # Phase5 retired as an active step, 2026-09-08 (user decision) -- same treatment, and
     # same file-level precedent, as Phase3 above: run_phase5() and phase5_second_level_
     # overlay_check.py stay in place (and phase5_trades/candidate_verification_results are

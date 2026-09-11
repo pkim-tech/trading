@@ -3238,12 +3238,167 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
     return result
 
 
+def _run_addon_cliff_cell_isolated(args):
+    """Picklable, top-level worker-callable wrapper around _evaluate_cell_ground_truth_
+    with_addon for run_addon_cliff_safety_ground_truth's real ProcessPoolExecutor dispatch
+    (2026-09-11, backlog item -- Phase4's per-candidate cliff-box neighborhood loop ran
+    single-process/sequential, a real regression versus scripts/phase5_second_level_
+    overlay_check.py's own ProcessPoolExecutor parallelism, lost when Phase5's
+    resimulation logic was folded into Phase4 (24a6776, 2026-09-08, to kill a "two
+    parallel computations of the same number drift apart" bug) -- only the LOGIC moved,
+    the parallelism was left behind in the now-mostly-unused Phase5 script).
+
+    Deliberately takes NO addon_cache_map/new_cache_rows args (unlike the function it
+    wraps) -- a ProcessPoolExecutor worker gets its own pickled COPY of any argument, not
+    a reference into the parent's actual dict/list, so an in-worker mutation of a cache
+    dict/list would be silently discarded when the worker returns, never reaching the
+    parent. Caller resolves cache hits BEFORE dispatch (this function's tasks are exactly
+    the real cache misses) and persists fresh results itself AFTER collecting every
+    worker's return value -- same "workers compute, parent owns all shared mutable
+    state" split _dispatch (bench_phase1_phase2_inmemory.py) already uses.
+
+    Single-tuple `args` (not *args) -- required by ProcessPoolExecutor.submit/pool.map's
+    own pickling of the callable+args pair, same convention run_single_backtest_node_
+    ground_truth_isolated already uses for its own worker signature.
+
+    Returns (coord, result) -- `coord` is the same cache_key shape _evaluate_cell_ground_
+    truth_with_addon computes internally (int(tp), round(sl,4), int(hold), int(w),
+    round(z,4), round(tpct,4)), recomputed here rather than trusting `result['coords']`
+    (which holds the RAW pre-rounding args) so a coordinate collision in the caller's
+    results dict is judged by the exact same key cliff_addon_cache's own PK uses."""
+    (ticker, strategy_name, tp, sl, hold_hours, w, z_thresh, fixed_sl, tpct, entry_timing,
+     start_date, end_date, spy_bh, years, data_source, addon_eligible, fill_resolution) = args
+    result = _evaluate_cell_ground_truth_with_addon(
+        ticker, strategy_name, tp, sl, hold_hours, w, z_thresh, fixed_sl, tpct,
+        entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
+        addon_eligible=addon_eligible, config_version=None, addon_cache_map=None,
+        new_cache_rows=None, fill_resolution=fill_resolution)
+    coord = (int(tp), round(float(sl), 4), int(hold_hours), int(w),
+              round(float(z_thresh), 4), round(float(tpct), 4))
+    return coord, result
+
+
+def _dispatch_addon_cliff_cells_grouped_by_wz(pool, coords, ticker, strategy_name, fixed_sl,
+                                               entry_timing, start_date, end_date, spy_bh, years,
+                                               data_source, addon_eligible, fill_resolution):
+    """coords: an iterable of (tp, sl, hold, w, z, tpct) coordinate tuples -- the real
+    cache MISSES run_addon_cliff_safety_ground_truth still needs computed, already
+    deduplicated across every candidate's own cell + full cliff-box neighborhood (many
+    candidates' neighborhoods overlap in practice, and a candidate's OWN coordinate is
+    always also a member of its own neighbor set -- see that function's docstring on why
+    deduplication changes zero computed values, only how many times each is computed).
+
+    Groups by (w, z) -- coord[3]/coord[4] -- before dispatch, same rationale as
+    bench_phase1_phase2_inmemory._dispatch_grouped_by_wz's own docstring (ported here,
+    not re-derived): _load_node_inputs_ground_truth's per-process _NODE_INPUT_CACHE_GT
+    memoizes prep/mprep per (ticker, strategy, w, ...) key (z_thresh isn't part of that
+    key), so interleaving cells across many distinct (w, z) pairs thrashes that cache
+    every few cells across a pool's workers instead of amortizing one prep/mprep build
+    across a whole group -- a real, previously-measured 50-130x throughput difference on
+    the analogous Phase2.5 path (see bench_phase1_phase2_inmemory.py's own docstring for
+    the exact numbers), not a hypothetical concern.
+
+    Returns {coord: result} for every coord in `coords` -- result is None for a cell with
+    no real trades (df_hourly_windowed empty, or zero trades generated), same as what
+    _evaluate_cell_ground_truth_with_addon already returns for those cases sequentially."""
+    results = {}
+    tasks_by_wz = {}
+    for coord in coords:
+        tp, sl, hold, w, z, tpct = coord
+        tasks_by_wz.setdefault((w, z), []).append(coord)
+    for (w, z), wz_coords in sorted(tasks_by_wz.items()):
+        futures = {
+            pool.submit(_run_addon_cliff_cell_isolated,
+                        (ticker, strategy_name, coord[0], coord[1], coord[2], coord[3], coord[4],
+                         fixed_sl, coord[5], entry_timing, start_date, end_date, spy_bh, years,
+                         data_source, addon_eligible, fill_resolution)): coord
+            for coord in wz_coords
+        }
+        for future in as_completed(futures):
+            # Keyed on the SUBMITTED coord (futures[future], already available -- not the
+            # worker's own recomputed/rounded coord _run_addon_cliff_cell_isolated
+            # returns) -- 2026-09-11, paired-review MEDIUM finding, both an independent-
+            # cold and a contextual Opus review converged on this independently: every
+            # OTHER pass in run_addon_cliff_safety_ground_truth (Pass 1/3's own coord
+            # generation, the sequential miss-compute branch) keys by the raw candidate-
+            # derived coordinate, never a rounded one. On today's real grids (int tp/sl/
+            # hold/window, 1-decimal z/tpct) rounding to 4 decimals is a no-op so the two
+            # keys always coincided -- but the moment any axis carries float noise beyond
+            # 4 decimals, the worker's key would silently diverge from every lookup here,
+            # and Pass 3 would read a missing dict key back as a false None (indistinguishable
+            # from a real "no trades" result) for every affected coordinate, exactly the
+            # "two parallel computations of the same number drift apart" failure class the
+            # 24a6776 Phase5-fold-in existed to kill -- and workers<=1 would keep returning
+            # the correct answer on the identical input, silently contradicting this
+            # function's own "dispatch order/path never affects a computed value" docstring
+            # claim. Using the already-known submitted coord makes the two paths structurally
+            # identical, not just numerically coincidental today.
+            _submitted_coord = futures[future]
+            _, result = future.result()
+            results[_submitted_coord] = result
+    return results
+
+
+def _cliff_neighbor_coords_gt(tp_c, sl_c, hold_c, w_c, z_c, tpct_c, radius, tpct_neighbors, hp):
+    """Real cliff-box neighborhood coordinate list for one candidate -- same shape/order
+    run_addon_cliff_safety_ground_truth's own neighbor loop always iterated (±radius in
+    TP/SL, ±7h hold from hp['hold_time_caps'], tpct_neighbors) -- factored out (2026-09-11)
+    so the coordinate-collection pass (before dispatch) and the aggregation pass (after
+    every coordinate is resolved) iterate identically without duplicating the loop body.
+    Order matches the original nested loop exactly (tp outer, sl, hold, tpct inner) --
+    load-bearing for n_neighbors_evaluated to count the same way it always has. The
+    candidate's own coordinate (tp_c, sl_c, hold_c, w_c, z_c, tpct_c) is always included
+    once among these, as one of the combos (tp=tp_c/sl=sl_c/hold=hold_c/tpct=tpct_c is
+    always in range) -- matching the original code's own redundant own-cell recompute
+    inside its neighbor loop, now deduplicated at the results-dict level instead
+    (see run_addon_cliff_safety_ground_truth's docstring on why that's value-preserving)."""
+    coords = []
+    for tp in range(max(1, tp_c - radius), min(30, tp_c + radius) + 1):
+        for sl in range(max(1, sl_c - radius), min(30, sl_c + radius) + 1):
+            for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
+                for tpct in tpct_neighbors:
+                    coords.append((tp, sl, hold, w_c, z_c, tpct))
+    return coords
+
+
 def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, hp, candidates,
                                          spy_bh, fixed_sl=0, entry_timing='open_check',
                                          start_date=None, end_date=None, years=None,
                                          data_source="yahoo", cliff_radius=None,
-                                         addon_eligible=True, fill_resolution='minute'):
-    """For each candidate from derive_phase25_candidates_ground_truth, computes the
+                                         addon_eligible=True, fill_resolution='minute',
+                                         workers=6):
+    """workers (2026-09-11, backlog item -- real regression fix, restores parallelism this
+    function's per-candidate cliff-box loop lost when Phase5's resimulation logic was
+    folded in here (24a6776, 2026-09-08) without its ProcessPoolExecutor coming along --
+    see _run_addon_cliff_cell_isolated's own docstring for the fold-in history).
+    `workers<=1` (NOT the default) keeps the exact original sequential code path,
+    byte-for-byte -- every cell computed one at a time in this process, same as before
+    this param existed; use this from a caller that's itself already running inside an
+    outer ProcessPoolExecutor worker (e.g. candidate_summary_report.run_gt_mode's own
+    per-scope pool) to avoid a nested pool, or for a direct apples-to-apples timing/
+    output comparison against the parallel path. `workers>1` (default 6, matching
+    phase5_second_level_overlay_check.py's own --workers default) creates a real
+    ProcessPoolExecutor local to this call (torn down before returning) and dispatches
+    every real cache-miss cell through it via _dispatch_addon_cliff_cells_grouped_by_wz,
+    grouped by (window, z) to avoid _NODE_INPUT_CACHE_GT thrashing across a pool's
+    workers -- see that function's own docstring. Every candidate's own cell + full
+    cliff-box neighborhood is flattened into ONE deduplicated coordinate set across ALL
+    candidates before dispatch (a candidate's own coordinate is always also a member of
+    its own neighbor loop -- see below -- and different candidates' neighborhoods
+    routinely overlap in practice), so a coordinate shared by two candidates (or by one
+    candidate's own_cell and its own neighbor loop) is computed exactly ONCE regardless
+    of how many candidates/positions reference it -- a genuine additional efficiency gain
+    over the original sequential code, which recomputed a candidate's own coordinate a
+    second time inside its own neighbor loop (own_cell and the coincident neighbor cell
+    are the SAME deterministic kernel call on the SAME inputs, so deduplicating them
+    changes zero computed values, confirmed by construction -- run_backtest_ground_truth
+    has no randomness). Dispatch ORDER (which (w,z) group runs first, which cell within a
+    group a given worker picks up) has no effect on any computed value -- every cell's
+    result depends only on its own coordinate's args, never on what else was dispatched
+    alongside it (same guarantee _dispatch_grouped_by_wz's own docstring establishes for
+    the analogous Phase2.5 path).
+
+    For each candidate from derive_phase25_candidates_ground_truth, computes the
     add-on-adjusted alpha/CAGR at the candidate's own cell AND across the same cliff-box
     neighborhood shape Phase2.5-GT's own dispatch would generate (±cliff_radius in
     TP/SL, ±7h hold neighbors from hp['hold_time_caps'], adjacent trail_pct for
@@ -3422,7 +3577,15 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
             data_source, start_date, end_date)
         new_cache_rows = []
 
-    results = []
+    # Pass 1: collect every candidate's own coordinate + full cliff-box neighborhood
+    # coordinate list, and the UNION of every distinct coordinate across all candidates
+    # (2026-09-11, real parallelization fix -- see this function's own docstring). Two
+    # candidates' neighborhoods routinely overlap in practice (adjacent islands), and a
+    # candidate's own coordinate is always also a member of its own neighbor list -- both
+    # are deduplicated here, computed exactly once each in Pass 2 below.
+    candidate_own_coords = []
+    candidate_neighbor_coords = []
+    all_coords = set()
     for cand in candidates:
         tp_c, sl_c, hold_c, w_c, z_c, tpct_c = (cand['take_profit'], cand['stop_loss'],
                                                  cand['max_hold_hours'], cand['window'],
@@ -3432,45 +3595,129 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
             tpct_neighbors = trail_pcts[max(0, idx - 1): idx + 2]
         else:
             tpct_neighbors = [tpct_c]
+        own_coord = (tp_c, sl_c, hold_c, w_c, z_c, tpct_c)
+        neighbor_coords = _cliff_neighbor_coords_gt(
+            tp_c, sl_c, hold_c, w_c, z_c, tpct_c, radius, tpct_neighbors, hp)
+        candidate_own_coords.append(own_coord)
+        candidate_neighbor_coords.append(neighbor_coords)
+        all_coords.add(own_coord)
+        all_coords.update(neighbor_coords)
 
-        own = _evaluate_cell_ground_truth_with_addon(
-            ticker, strategy_name, tp_c, sl_c, hold_c, w_c, z_c, fixed_sl, tpct_c,
-            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
-            addon_eligible=addon_eligible, config_version=config_version,
-            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows,
-            fill_resolution=fill_resolution)
+    # Pass 2: resolve every distinct coordinate to a result. Cache hits first (same
+    # cache_key convention _evaluate_cell_ground_truth_with_addon uses internally,
+    # reproduced here since we're now checking the cache map directly instead of letting
+    # each individual call do it) -- addon_eligible always stamped with the CURRENT
+    # call's value on a cache hit, matching that function's own cache-hit behavior. Real
+    # cache MISSES are computed sequentially (workers<=1, byte-identical to the original
+    # code) or via a real ProcessPoolExecutor grouped by (window, z) (workers>1, default).
+    all_results = {}
+    miss_coords = []
+    for coord in all_coords:
+        tp, sl, hold, w, z, tpct = coord
+        cell_cache_key = (int(tp), round(float(sl), 4), int(hold), int(w),
+                          round(float(z), 4), round(float(tpct), 4))
+        cached = addon_cache_map.get(cell_cache_key) if addon_cache_map is not None else None
+        if cached is not None:
+            all_results[coord] = {**cached, 'addon_eligible': addon_eligible}
+        else:
+            miss_coords.append(coord)
+
+    if miss_coords:
+        if workers > 1:
+            # Preload-before-fork (2026-09-11, same pattern bench_phase1_phase2_inmemory.py's
+            # main() already uses for its own pools, ported from phase5_second_level_
+            # overlay_check.py's original module-globals-before-pool-creation design):
+            # loads this ticker's hourly/minute-or-second dataframe ONCE in this (parent)
+            # process, in this process's global loader caches, BEFORE the pool below forks
+            # -- every worker inherits the already-loaded frame via copy-on-write instead
+            # of independently loading its own private copy. Real, measured cost of
+            # skipping this: a first cut of this fix WITHOUT the preload ran SLOWER than
+            # the original sequential path on a real 6-candidate test (12.2s parallel vs
+            # 10.6s sequential, fill_resolution='second') -- 6 workers each paying their own
+            # ~2.85GB second-resolution load (see bench_phase1_phase2_inmemory.py's own
+            # 2026-09-11 fix for the exact same root cause on the analogous Phase2.5 path)
+            # dominated the real backtest work at this candidate count. Falls back to
+            # ACTUALLY PRELOADING minute (2026-09-11, paired-review LOW finding, both
+            # reviewers -- an earlier version of this just `pass`ed on ValueError, which
+            # meant every worker would still independently load its own private minute
+            # frame, exactly the duplication this preload exists to prevent) if no active
+            # massive_second_derived build exists for this ticker -- never a hard failure,
+            # matches _load_node_inputs_ground_truth's own real fallback behavior
+            # (:1152-1159) that every individual worker would otherwise hit on its own.
+            _load_hourly_df_ground_truth(ticker, data_source=data_source)
+            if fill_resolution == "second":
+                try:
+                    _load_second_df(ticker, data_source=data_source)
+                except ValueError:
+                    _load_minute_df(ticker, data_source=data_source)
+            else:
+                _load_minute_df(ticker, data_source=data_source)
+            # NOTE: deliberately NO initializer=_warmup_worker here (2026-09-11,
+            # paired-review MEDIUM finding, independent-cold review, tried and reverted
+            # same night): _warmup_worker JIT-warms the LEGACY hourly kernel
+            # (_simulate/_simulate_limit/etc., backtester.py's non-GT njit functions,
+            # imported at this file's top) -- a different numba kernel family from the
+            # one run_backtest_ground_truth/_evaluate_cell_ground_truth_with_addon
+            # actually calls. Adding it here measured SLOWER (31.4s vs the no-warmup
+            # 14.8s on the same real 27-candidate test) -- pure wasted per-worker compile/
+            # cache-load cost for functions this path never calls, not a genuine warmup.
+            # This file's OTHER pool (dispatch_parallel_grid_ground_truth's shared_pool)
+            # uses _warmup_worker correctly because IT dispatches the legacy kernel this
+            # initializer actually warms -- not a pattern to blindly copy onto a
+            # different kernel family without checking which njit functions the real
+            # workload calls.
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                fresh = _dispatch_addon_cliff_cells_grouped_by_wz(
+                    pool, miss_coords, ticker, strategy_name, fixed_sl, entry_timing,
+                    start_date, end_date, spy_bh, years, data_source, addon_eligible,
+                    fill_resolution)
+        else:
+            fresh = {}
+            for coord in miss_coords:
+                tp, sl, hold, w, z, tpct = coord
+                fresh[coord] = _evaluate_cell_ground_truth_with_addon(
+                    ticker, strategy_name, tp, sl, hold, w, z, fixed_sl, tpct,
+                    entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
+                    addon_eligible=addon_eligible, config_version=None, addon_cache_map=None,
+                    new_cache_rows=None, fill_resolution=fill_resolution)
+        all_results.update(fresh)
+        if use_cache:
+            for coord, result in fresh.items():
+                if result is not None:
+                    cell_cache_key = (int(coord[0]), round(float(coord[1]), 4), int(coord[2]),
+                                      int(coord[3]), round(float(coord[4]), 4), round(float(coord[5]), 4))
+                    new_cache_rows.append((cell_cache_key, result))
+
+    # Pass 3: aggregate each candidate's own_cell + worst-case neighbor, exactly the same
+    # logic as before -- now reading pre-resolved results from all_results instead of
+    # calling _evaluate_cell_ground_truth_with_addon inline.
+    results = []
+    for cand, own_coord, neighbor_coords in zip(candidates, candidate_own_coords, candidate_neighbor_coords):
+        own = all_results.get(own_coord)
 
         neighbor_addon_cagrs = []
         neighbor_core_cagrs = []
-        for tp in range(max(1, tp_c - radius), min(30, tp_c + radius) + 1):
-            for sl in range(max(1, sl_c - radius), min(30, sl_c + radius) + 1):
-                for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
-                    for tpct in tpct_neighbors:
-                        cell = _evaluate_cell_ground_truth_with_addon(
-                            ticker, strategy_name, tp, sl, hold, w_c, z_c, fixed_sl, tpct,
-                            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
-                            addon_eligible=addon_eligible, config_version=config_version,
-                            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows,
-                            fill_resolution=fill_resolution)
-                        if cell is not None:
-                            # cagr, not alpha (2026-08-23, ground_truth_kernel_rebuild.md
-                            # Step 4): raw alpha differences are unbounded below -100%
-                            # (confirmed root cause of KORU's confusing sub-(-100%)
-                            # worst_neighbor_pct reading) -- cagr is the bounded,
-                            # real-compounded-return figure already computed on the same
-                            # cell dict, just unused for this purpose until now.
-                            # addon_cagr is None when apply_addon_overlay_ground_truth
-                            # flagged a return_below_floor breach for this cell (see
-                            # _evaluate_cell_ground_truth_with_addon) -- excluded from the
-                            # worst-neighbor min() rather than crashing on a None/float
-                            # comparison or, worse, being silently treated as the most
-                            # negative value. core_cagr is never None (core Return is
-                            # always >= -1, so core aggregation can't hit this failure
-                            # mode) but included in the same None-guard for symmetry.
-                            if cell['addon_cagr'] is not None:
-                                neighbor_addon_cagrs.append(cell['addon_cagr'])
-                            if cell['core_cagr'] is not None:
-                                neighbor_core_cagrs.append(cell['core_cagr'])
+        for coord in neighbor_coords:
+            cell = all_results.get(coord)
+            if cell is not None:
+                # cagr, not alpha (2026-08-23, ground_truth_kernel_rebuild.md
+                # Step 4): raw alpha differences are unbounded below -100%
+                # (confirmed root cause of KORU's confusing sub-(-100%)
+                # worst_neighbor_pct reading) -- cagr is the bounded,
+                # real-compounded-return figure already computed on the same
+                # cell dict, just unused for this purpose until now.
+                # addon_cagr is None when apply_addon_overlay_ground_truth
+                # flagged a return_below_floor breach for this cell (see
+                # _evaluate_cell_ground_truth_with_addon) -- excluded from the
+                # worst-neighbor min() rather than crashing on a None/float
+                # comparison or, worse, being silently treated as the most
+                # negative value. core_cagr is never None (core Return is
+                # always >= -1, so core aggregation can't hit this failure
+                # mode) but included in the same None-guard for symmetry.
+                if cell['addon_cagr'] is not None:
+                    neighbor_addon_cagrs.append(cell['addon_cagr'])
+                if cell['core_cagr'] is not None:
+                    neighbor_core_cagrs.append(cell['core_cagr'])
 
         # Fail CLOSED (None/"unknown"), not open to "safe", when nothing was evaluated --
         # paired-review finding (2026-08-22, all 4 review passes converged on this
@@ -3927,8 +4174,19 @@ def _overlay_risk_checks_gt(trades, drought, robustness_cagr_min=GT_ROBUSTNESS_C
 def build_candidate_report_ground_truth(ticker, strategy_name, config_version, hp,
                                          start_date, end_date, fixed_sl=0,
                                          entry_timing='open_check', data_source="yahoo",
-                                         cliff_radius=None, candidates_override=None):
-    """candidates_override (2026-08-29, Task #3, additive -- see Review-Gate Persistence
+                                         cliff_radius=None, candidates_override=None,
+                                         addon_cliff_workers=6):
+    """addon_cliff_workers (2026-09-11, backlog item -- real regression fix, see
+    run_addon_cliff_safety_ground_truth's own docstring): threaded straight through to
+    that call below as its `workers` param. Default 6 restores real parallelism to
+    Phase4's cliff-box neighborhood pass. Pass 1 (or <=1) from a caller that's itself
+    already running inside an outer ProcessPoolExecutor worker (e.g. candidate_summary_
+    report.run_gt_mode's own per-scope pool) to avoid a nested pool -- every existing
+    caller of this function passes nothing and gets the new default (6, parallel ON),
+    NOT byte-identical to pre-existing behavior by default (unlike candidates_override
+    above) -- this IS the fix, not an opt-in.
+
+    candidates_override (2026-08-29, Task #3, additive -- see Review-Gate Persistence
     Rule outcome recorded in this commit's message): when provided, use this candidate
     list directly instead of calling derive_phase25_candidates_ground_truth -- lets a
     caller feed a candidate_nodes-sourced list (scripts/phase4_candidate_nodes_resolver.py)
@@ -4032,7 +4290,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             ticker, strategy_name, config_version, hp, phase4_candidates, spy_bh, fixed_sl=fixed_sl,
             entry_timing=entry_timing, start_date=start_date, end_date=end_date, years=years,
             data_source=data_source, cliff_radius=cliff_radius, addon_eligible=addon_eligible,
-            fill_resolution=_resim_fill_resolution)
+            fill_resolution=_resim_fill_resolution, workers=addon_cliff_workers)
     else:
         eligible_addon_results = []
     _addon_by_id = dict(zip((id(c) for c in phase4_candidates), eligible_addon_results))
