@@ -1946,7 +1946,8 @@ REGISTRY = [
                   "stops these from stacking)",
          code_path="schwab_safety.check_order (same-ticker resting-order dup guard, "
                    "_has_open_buy_order_for_ticker for addon legs / _has_open_order otherwise)",
-         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         offline_coverage="tests/test_schwab_safety.py::test_dup_order_blocked_logs_event "
+                          "(added 2026-09-10, coverage-registry gap-fill dispatch)",
          check_mechanism='coverage_events', scenario_key='dup_order_blocked',
          bad_results=[],
          notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Blocking is designed "
@@ -1957,7 +1958,8 @@ REGISTRY = [
                   "it was passed with -- fails safe to the old ambiguous ticker+account derivation "
                   "rather than raising, but the mismatch itself is logged so it's visible",
          code_path="schwab_safety.check_order (node_id verification, added Opus review 2026-08-10)",
-         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         offline_coverage="tests/test_schwab_safety.py::test_node_id_ticker_account_mismatch_logs_event_and_falls_back "
+                          "(added 2026-09-10, coverage-registry gap-fill dispatch)",
          check_mechanism='coverage_events', scenario_key='node_id_ticker_account_mismatch',
          bad_results=['fallback'],
          notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result is always 'fallback' "
@@ -1970,7 +1972,8 @@ REGISTRY = [
                   "the account has already hit its daily_order_cap -- BUY-only cap must not block a "
                   "protective completion of an already-open position",
          code_path="schwab_safety.check_order (daily_order_cap check, is_protective exemption)",
-         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         offline_coverage="tests/test_schwab_safety.py::test_daily_cap_protective_bypass_logs_event "
+                          "(added 2026-09-10, coverage-registry gap-fill dispatch)",
          check_mechanism='coverage_events', scenario_key='daily_cap_protective_bypass',
          bad_results=[],
          notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result is always 'allowed' -- "

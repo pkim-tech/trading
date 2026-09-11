@@ -962,3 +962,64 @@ def test_pre_action_state_verification_fetch_failure_does_not_block(env, monkeyp
     events = signals_db.get_coverage_events(scenario_key='pre_action_state_verification')
     failed = [e for e in events if e['ticker'] == TICKER and e['result'] == 'fetch_failed']
     assert failed, f"expected a 'fetch_failed' event, got: {events}"
+
+
+def test_daily_cap_protective_bypass_logs_event(env, monkeypatch):
+    """coverage_registry.py gap-fill dispatch, 2026-08-31: the
+    is_protective-exempts-daily-cap behavior itself was already proven
+    (test_protective_top_up_bypasses_exhausted_daily_cap above), but no test
+    asserted the daily_cap_protective_bypass coverage event -- the
+    accountability record IS the point of this scenario_key (per its own
+    REGISTRY notes: 'this IS the accountability record for the bypass, every
+    firing reviewable')."""
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['roth'], 'daily_order_cap', 1)
+    schwab_client.place_equity_buy('roth', TICKER, 5, 50.0)  # exhaust the cap
+    result = schwab_client.place_equity_buy('roth', TICKER, 50, 50.0, is_protective=True)
+    assert result == (None, None)  # dry_run -- not blocked, not raised
+    events = signals_db.get_coverage_events(scenario_key='daily_cap_protective_bypass')
+    assert len(events) == 1
+    assert events[0]['result'] == 'allowed'
+
+
+def test_dup_order_blocked_logs_event(env, monkeypatch):
+    """A resting BUY for this ticker must block a second concurrent BUY (same
+    guard as test_second_sell_order_for_same_ticker_blocked, SELL side) --
+    scenario_key dup_order_blocked was previously untested (coverage_registry.py
+    gap-fill dispatch, 2026-08-31)."""
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderLegCollection": [
+            {"instruction": "BUY", "instrument": {"symbol": TICKER}}
+        ]}
+    ])
+    with pytest.raises(schwab_safety.SafetyViolation, match="already has an open/working order"):
+        schwab_client.place_equity_buy('roth', TICKER, 5, 50.0)
+    events = signals_db.get_coverage_events(scenario_key='dup_order_blocked')
+    assert len(events) == 1
+    assert events[0]['result'] == 'blocked_same_ticker'
+
+
+def test_node_id_ticker_account_mismatch_logs_event_and_falls_back(env):
+    """A caller-supplied node_id that doesn't actually belong to the (ticker,
+    account) pair it's called with must fail SAFE (fall back to the ambiguous
+    ticker+account derivation, not raise) while still logging the mismatch --
+    scenario_key node_id_ticker_account_mismatch was previously untested
+    (coverage_registry.py gap-fill dispatch, 2026-08-31). Uses a second node
+    for the SAME ticker in a DIFFERENT account (mirrors the real
+    AGQ/brokerage collision that motivated this guard, 2026-08-10)."""
+    node_roth = _get_node()
+    signals_db.add_node(TICKER, 'ZScoreBreakout', 'test_mismatch', window=20,
+                         take_profit=10, stop_loss=5, max_hold_hours=56, state='live',
+                         account='brokerage')
+    node_brokerage = signals_db.get_watch_list_node(ticker=TICKER, account='brokerage',
+                                                     version='test_mismatch')
+    # Call with account='roth' but node_brokerage's id (belongs to 'brokerage') --
+    # a real mismatch. Must not raise: falls back to the ticker+account lookup,
+    # which resolves unambiguously to node_roth since only one node exists for
+    # (TICKER, roth).
+    result = schwab_client.place_equity_buy('roth', TICKER, 5, 50.0, node_id=node_brokerage['id'])
+    assert result == (None, None)  # dry_run -- not blocked, not raised
+    events = signals_db.get_coverage_events(scenario_key='node_id_ticker_account_mismatch')
+    assert len(events) == 1
+    assert events[0]['result'] == 'fallback'
+    assert "node.ticker='TEST_SAFETY' node.account='brokerage'" in events[0]['detail']
+    assert "call ticker='TEST_SAFETY' account='roth'" in events[0]['detail']
