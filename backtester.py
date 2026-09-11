@@ -2347,6 +2347,7 @@ def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fi
             ivol_series = None
 
     cells = {}
+    cell_window_times = {}
     windows_by_cd = {}
     for confirm_days in confirm_days_grid:
         windows = find_drought_windows(bar_trades, df_hourly_windowed, confirm_days)
@@ -2367,11 +2368,23 @@ def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fi
                         gated.append((entry_i, backstop_i))
             if not gated:
                 continue
-            rets = [simulate_overlay(df_hourly_windowed, entry_i, backstop_i,
-                                      fixed_sl_pct=fixed_sl, arm_pct=arm_pct,
-                                      trail_sell_pct=trail_sell_pct)['ret']
-                    for entry_i, backstop_i in gated]
+            gated_results = [simulate_overlay(df_hourly_windowed, entry_i, backstop_i,
+                                               fixed_sl_pct=fixed_sl, arm_pct=arm_pct,
+                                               trail_sell_pct=trail_sell_pct)
+                              for entry_i, backstop_i in gated]
+            rets = [r['ret'] for r in gated_results]
+            # (start_time, end_time) per window, same order as `rets` -- start_time is the
+            # real entry bar (idx[entry_i + 1], simulate_overlay's own entry_bar convention,
+            # matching scripts/drought_overlay_test.py main()'s entry_time reporting), end_time
+            # is the real exit bar (idx[result['exit_i']]). Added 2026-09-11 so a caller can
+            # build trades-shaped dicts for the drought-only/core+drought risk checks -- the
+            # window tuples alone (bar-index positions) carried no timestamp a caller could
+            # merge/sort against core trades by.
+            window_times = [(idx[entry_i + 1] if entry_i + 1 < n_bars else idx[entry_i],
+                              idx[r['exit_i']])
+                             for (entry_i, backstop_i), r in zip(gated, gated_results)]
             cells[(confirm_days, vol_gate)] = rets
+            cell_window_times[(confirm_days, vol_gate)] = window_times
 
     if not cells:
         return {
@@ -2379,7 +2392,7 @@ def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fi
             'best_confirm_days': None, 'best_vol_gate': None,
             'n_drought_windows': 0, 'n_drought_simulated': 0,
             'drought_compounded_pct': None, 'combined_compounded_pct': None,
-            'n_grid_cells_evaluated': 0, 'best_rets': None,
+            'n_grid_cells_evaluated': 0, 'best_rets': None, 'best_window_times': None,
         }
 
     def _combined_compounded(rets):
@@ -2404,6 +2417,12 @@ def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fi
         # the actual windows, not just the aggregate drought_compounded_pct. None whenever
         # the winning cell doesn't exist (the `not cells` branch above).
         'best_rets': best_rets,
+        # 'best_window_times' (2026-09-11, overlay-inclusive Check11/Check13 risk-check
+        # build-out): per-window (start_time, end_time), SAME order as `best_rets` -- lets a
+        # caller build trades-shaped dicts (Entry Time/Exit Time/Return) for the drought-only
+        # and core+drought risk-check equity curves without a second bar-index resolution
+        # pass. None whenever best_rets is None (the `not cells` branch above).
+        'best_window_times': cell_window_times[best_key],
     }
 
 

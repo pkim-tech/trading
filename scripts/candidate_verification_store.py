@@ -449,6 +449,28 @@ _PHASE4_VALUE_COLUMNS = [
     # core_both_cagr_pct is the same quantity in both places. See run_optimization_sweep.
     # _stacked_overlay_cagrs_gt's NAMING WARNING.
     "core_addon_cagr_ungated_pct", "core_drought_cagr_ungated_pct", "core_both_cagr_pct",
+    # Overlay-inclusive Check11/Check13 risk checks (2026-09-11, backlog item found
+    # 2026-09-08 -- every check11/check13 above is CORE-only, so a promoted addon/
+    # drought node had zero drawdown/fold-fragility verification on the overlay portion
+    # of its equity curve). One (max_drawdown_pct, worst_fold_cagr_pct, any_fold_fragile,
+    # n_folds_populated) quadruple per equity curve -- see run_optimization_sweep.
+    # _overlay_risk_checks_gt's own docstring for exactly what each curve is, why the 3
+    # core-inclusive combos carry an `_ungated` suffix (a real, deliberate naming-
+    # collision fix -- these are NOT the same curve as this table's own gated
+    # core_both_cagr_pct), why n_folds_populated exists (an empty check13 fold silently
+    # reads as "not fragile" -- this lets a reader tell that apart from a genuinely
+    # healthy fold after the fact), and why the drought-inclusive combos degrade to
+    # their non-drought counterpart (not None) when drought found no real windows.
+    "addon_only_max_drawdown_pct", "addon_only_worst_fold_cagr_pct", "addon_only_any_fold_fragile",
+    "addon_only_n_folds_populated",
+    "core_addon_ungated_max_drawdown_pct", "core_addon_ungated_worst_fold_cagr_pct",
+    "core_addon_ungated_any_fold_fragile", "core_addon_ungated_n_folds_populated",
+    "drought_only_max_drawdown_pct", "drought_only_worst_fold_cagr_pct", "drought_only_any_fold_fragile",
+    "drought_only_n_folds_populated",
+    "core_drought_ungated_max_drawdown_pct", "core_drought_ungated_worst_fold_cagr_pct",
+    "core_drought_ungated_any_fold_fragile", "core_drought_ungated_n_folds_populated",
+    "core_both_ungated_max_drawdown_pct", "core_both_ungated_worst_fold_cagr_pct",
+    "core_both_ungated_any_fold_fragile", "core_both_ungated_n_folds_populated",
 ]
 
 
@@ -506,6 +528,17 @@ def ensure_phase4_table(conn):
                  "core_both_cagr_pct"):
         if _col not in existing_p4_cols:
             conn.execute(f"ALTER TABLE phase4_results ADD COLUMN {_col} REAL")
+    # Overlay-inclusive Check11/Check13 risk checks (2026-09-11), same probe-first ALTER
+    # pattern -- any_fold_fragile/n_folds_populated columns are INTEGER (bool/count),
+    # matching check13_any_fold_fragile's own type above.
+    for _prefix in ("addon_only", "core_addon_ungated", "drought_only",
+                     "core_drought_ungated", "core_both_ungated"):
+        for _col, _type in ((f"{_prefix}_max_drawdown_pct", "REAL"),
+                             (f"{_prefix}_worst_fold_cagr_pct", "REAL"),
+                             (f"{_prefix}_any_fold_fragile", "INTEGER"),
+                             (f"{_prefix}_n_folds_populated", "INTEGER")):
+            if _col not in existing_p4_cols:
+                conn.execute(f"ALTER TABLE phase4_results ADD COLUMN {_col} {_type}")
 
 
 def get_stored_phase4(conn, candidate_id):

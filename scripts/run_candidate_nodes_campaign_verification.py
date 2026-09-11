@@ -74,6 +74,16 @@ def _phase4_fields_from_row(row):
         "core_addon_cagr_ungated_pct": row.get("core_addon_cagr_ungated_pct"),
         "core_drought_cagr_ungated_pct": row.get("core_drought_cagr_ungated_pct"),
         "core_both_cagr_pct": row.get("core_both_cagr_pct"),
+        # Overlay-inclusive Check11/Check13 risk checks (2026-09-11) -- already
+        # aggregate-summarized by run_optimization_sweep._overlay_risk_checks_gt, threaded
+        # straight through from gt_rows_for_scope's `out` dict, same as the CAGR fields
+        # above (no further summarization needed here, unlike core check13's own
+        # fold1-5 -> worst_fold_cagr_pct/any_fold_fragile reduction just above). The 3
+        # core-inclusive prefixes carry `_ungated` -- see that function's own docstring.
+        **{f"{p}_{s}": row.get(f"{p}_{s}")
+           for p in ("addon_only", "core_addon_ungated", "drought_only",
+                     "core_drought_ungated", "core_both_ungated")
+           for s in ("max_drawdown_pct", "worst_fold_cagr_pct", "any_fold_fragile", "n_folds_populated")},
     }
 
 

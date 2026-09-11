@@ -3754,18 +3754,32 @@ def _check11_max_drawdown_gt(trades):
     return max_dd * 100.0, dd_peak_time, dd_trough_time
 
 
-def _check13_walk_forward_gt(trades, robustness_cagr_min=GT_ROBUSTNESS_CAGR_MIN):
+def _check13_walk_forward_gt(trades, robustness_cagr_min=GT_ROBUSTNESS_CAGR_MIN, date_range=None):
     """Check 13 (walk-forward N-fold), ported from checklist_v65.check13_walk_forward --
     same equal-TIME-span 5-fold slicing. Reports each fold's own CAGR (GT trades carry
     Return directly, no alpha-vs-SPY split needed the way the hourly path's possible/
     pessimistic/certain triple required) and flags a fold 'fragile' at CAGR<=20%
     (GT_ROBUSTNESS_CAGR_MIN, the project's established robustness bar) -- NOT the 30%
     PHASE25_ISLAND_CAGR_MIN candidate-quality bar used elsewhere in this pipeline; the
-    two are deliberately different thresholds for two different purposes."""
+    two are deliberately different thresholds for two different purposes.
+
+    date_range (added 2026-09-11, overlay-inclusive risk-check build-out -- paired-review
+    HIGH finding, confirmed on rebuttal by both an independent-cold and a contextual Opus
+    review): optional (start, end) Timestamp pair to fold against INSTEAD OF this curve's
+    own Entry Time min / Exit Time max. Required for a sparse/clustered overlay curve
+    (addon-only/drought-only) -- folding on the curve's OWN extent makes fold_years an
+    artifact of how clustered the curve's own activity happens to be, not a real measure
+    of time-robustness (empirically reproduced: 6 drought windows at +30% clustered into
+    an 18-day span of a 5-year backtest inflated worst_fold_cagr_pct to ~1e14 and read as
+    'not fragile' -- a false negative, not a false alarm, since annualizing a whole
+    compounded return against a near-zero elapsed time explodes the CAGR). Defaults to
+    None (the original curve-derived behavior) -- every pre-existing caller (core-only
+    check13) is byte-identical to before this param existed."""
     if len(trades) < GT_WALK_FORWARD_FOLDS:
         return []
     df = pd.DataFrame(trades).sort_values("Entry Time")
-    dates_min, dates_max = df["Entry Time"].min(), df["Exit Time"].max()
+    dates_min, dates_max = date_range if date_range is not None else (
+        df["Entry Time"].min(), df["Exit Time"].max())
     span = dates_max - dates_min
     edges = [dates_min + span * i / GT_WALK_FORWARD_FOLDS for i in range(GT_WALK_FORWARD_FOLDS + 1)]
     rows = []
@@ -3787,6 +3801,127 @@ def _check13_walk_forward_gt(trades, robustness_cagr_min=GT_ROBUSTNESS_CAGR_MIN)
         fragile = True if cagr is None else (cagr <= robustness_cagr_min)
         rows.append({'fold': i + 1, 'n': len(sub), 'compounded_pct': compounded, 'cagr': cagr, 'fragile': fragile})
     return rows
+
+
+def _overlay_risk_checks_gt(trades, drought, robustness_cagr_min=GT_ROBUSTNESS_CAGR_MIN):
+    """Overlay-inclusive Check11 (max drawdown) / Check13 (5-fold walk-forward) risk
+    checks (backlog item found 2026-09-08 -- every existing safety check is core-only,
+    so a promoted addon/drought node has zero drawdown/fold-fragility verification on
+    the overlay portion of its equity curve). Runs both checks against 5 equity curves:
+    addon-only, core+addon (ungated), drought-only, core+drought (ungated), and
+    core+addon+drought (ungated).
+
+    The `_ungated` prefix on the 3 core-inclusive combos (2026-09-11, paired-review
+    MEDIUM finding, both an independent-cold and a contextual Opus review converged on
+    this) is load-bearing, matching _stacked_overlay_cagrs_gt's own NAMING WARNING: this
+    row's `core_both_cagr_pct` column is the GATED stacked CAGR (each overlay factor
+    independently gated on its own chrono-split robustness verdict, plus the drought_ie
+    REAL_SELECTION override) -- these risk columns are computed on the raw UNGATED merge
+    instead, a genuinely different curve, so they must not share the unsuffixed name.
+
+    Each combo's check13 is summarized to (worst_fold_cagr_pct, any_fold_fragile,
+    n_folds_populated) -- the same aggregate-result granularity phase4_results already
+    uses for the core check13 columns (see run_candidate_nodes_campaign_verification.
+    _phase4_fields_from_row), plus n_folds_populated (2026-09-11, paired-review HIGH
+    finding, confirmed on rebuttal by both reviewers): a fold with n=0 trades reports
+    cagr=None/fragile=None, which `any(...)`/`min(real_folds)` silently treat as "not
+    fragile" -- indistinguishable from a curve with 5 genuinely healthy folds. Real data
+    (2026-09-11 query against candidate_nodes.phase4_checklist_json's drought_n_simulated,
+    n=22,643): 8.0% of drought-bearing candidates have <5 windows, 29.4% have <10 -- with
+    <10 windows over 5 equal-time folds, empty/single-trade folds are the COMMON case for
+    drought_only, not an edge case. n_folds_populated lets a downstream reader tell
+    "curve too sparse to trust any_fold_fragile" (n_folds_populated < 5) apart from "5
+    real folds, genuinely not fragile" after the fact, without re-running Phase4.
+
+    All 5 combos fold against the SAME (start, end) time axis -- the real trades list's
+    own Entry Time min / Exit Time max, i.e. the real backtest span -- via
+    _check13_walk_forward_gt's new `date_range` param (2026-09-11, paired-review HIGH
+    finding, confirmed on rebuttal: reproduced directly, 6 drought windows at +30%
+    clustered into an 18-day span of a 5-year backtest inflated worst_fold_cagr_pct to
+    ~1e14 and read as 'not fragile' when folding on the curve's OWN sparse extent instead
+    of the real backtest span -- a false negative on exactly the candidates this check
+    exists to scrutinize). `trades` (the core list) is always non-empty here (this
+    function is only ever called from inside the phase4_eligible-gated branch, which
+    already requires real trades), so core_span is always resolvable.
+
+    addon-only's per-trade Return is the UNBLENDED (Exit Price - Arm Price)/Arm Price leg
+    return -- the SAME formula _stacked_overlay_cagrs_gt already computes for its own
+    addon_rets, reused verbatim here, NOT apply_addon_overlay_ground_truth's own blended
+    'Return' (which already contains core's own return -- see that function's own
+    double-counting-trap docstring note). core+addon uses the blended 'Return' as-is
+    (apply_addon_overlay_ground_truth's direct output already carries real Entry Time/
+    Exit Time/Return per trade, no reshaping needed) -- EXCEPT that a blended Return has
+    no -1.0 floor (backtester.py's own `return_below_floor` flag on each trade), and
+    _check11_max_drawdown_gt has no <=-100% guard of its own -- an unfloored breach
+    compounds equity NEGATIVE, after which the reported drawdown grows UNBOUNDED and
+    SIGN-INVERTED (a better subsequent trade makes the reported "drawdown" worse, since
+    multiplying a negative equity by a >1 factor drives it further from zero). Confirmed
+    empirically on rebuttal (both reviewers): 10 trades after a single floor breach
+    reported a "drawdown" of -2983%. `core_addon`/`core_both` (both built off the blended
+    Return) are therefore None'd out whenever any trade breaches the floor, mirroring the
+    established refuse-to-aggregate convention at run_optimization_sweep.py's
+    _evaluate_cell_ground_truth_with_addon (2026-09-11, paired-review HIGH finding).
+    `addon_only` is unaffected -- its (X-A)/A leg return is naturally floored at -1.
+
+    Drought windows are the definitionally-disjoint GAPS between consecutive core fills
+    (find_drought_windows defines a window as the space between two consecutive real
+    signals) -- combos merging drought windows with core (or core+addon) trades use a
+    plain time-sort merge (_merge_trades_by_entry_time_gt), no interleaving logic needed.
+    When drought has no real winning-cell trades, the drought-inclusive combos degrade
+    to exactly their non-drought counterpart (core_drought_ungated==core,
+    core_both_ungated==core_addon_ungated), not to None -- a real, if drought-empty,
+    equity curve.
+
+    Returns a dict with keys {prefix}_max_drawdown_pct/{prefix}_worst_fold_cagr_pct/
+    {prefix}_any_fold_fragile/{prefix}_n_folds_populated for prefix in (addon_only,
+    core_addon_ungated, drought_only, core_drought_ungated, core_both_ungated) -- all
+    None for a prefix whose curve has zero trades (e.g. drought_only when drought found
+    no windows, or addon_only when no addon trade ever armed) or whose curve is floor-
+    breach-poisoned (core_addon_ungated/core_both_ungated only)."""
+    addon_trades = apply_addon_overlay_ground_truth(trades) if trades else []
+    armed = [t for t in addon_trades if t.get("armed")]
+    addon_only = [{'Entry Time': t['Arm Time'], 'Exit Time': t['Exit Time'],
+                   'Return': (t['Exit Price'] - t['Arm Price']) / t['Arm Price']}
+                  for t in armed]
+    core_addon = addon_trades
+    floor_breached = any(t.get('return_below_floor') for t in core_addon)
+
+    drought_only = []
+    if drought is not None and drought.get('best_rets') is not None:
+        drought_only = [{'Entry Time': s, 'Exit Time': e, 'Return': r}
+                         for (s, e), r in zip(drought['best_window_times'], drought['best_rets'])]
+
+    def _merge_trades_by_entry_time_gt(*trade_lists):
+        merged = [t for lst in trade_lists for t in lst]
+        merged.sort(key=lambda t: t['Entry Time'])
+        return merged
+
+    core_drought = _merge_trades_by_entry_time_gt(trades, drought_only) if trades else []
+    core_both = _merge_trades_by_entry_time_gt(core_addon, drought_only) if core_addon else []
+
+    core_span = (min(t['Entry Time'] for t in trades), max(t['Exit Time'] for t in trades)) if trades else None
+
+    curves = {
+        'addon_only': (addon_only, False), 'core_addon_ungated': (core_addon, floor_breached),
+        'drought_only': (drought_only, False), 'core_drought_ungated': (core_drought, False),
+        'core_both_ungated': (core_both, floor_breached),
+    }
+    out = {}
+    for prefix, (curve, poisoned) in curves.items():
+        if not curve or poisoned:
+            out[f'{prefix}_max_drawdown_pct'] = None
+            out[f'{prefix}_worst_fold_cagr_pct'] = None
+            out[f'{prefix}_any_fold_fragile'] = None
+            out[f'{prefix}_n_folds_populated'] = None
+            continue
+        dd_pct, _, _ = _check11_max_drawdown_gt(curve)
+        folds = _check13_walk_forward_gt(curve, robustness_cagr_min=robustness_cagr_min, date_range=core_span)
+        real_folds = [f['cagr'] for f in folds if f['cagr'] is not None]
+        out[f'{prefix}_max_drawdown_pct'] = dd_pct
+        out[f'{prefix}_worst_fold_cagr_pct'] = min(real_folds) if real_folds else None
+        out[f'{prefix}_any_fold_fragile'] = any(bool(f['fragile']) for f in folds) if folds else None
+        out[f'{prefix}_n_folds_populated'] = sum(1 for f in folds if f['n']) if folds else None
+    return out
 
 
 def build_candidate_report_ground_truth(ticker, strategy_name, config_version, hp,
@@ -4110,9 +4245,15 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             # its drought factor degenerates to a neutral 1.0, making it a mere duplicate
             # of the add-on number rather than a real triple stack.
             core_addon_cagr_ungated = core_drought_cagr_ungated = core_both_cagr = None
+            # overlay_risk (2026-09-11, overlay-inclusive Check11/Check13 risk-check
+            # build-out): same phase4_eligible compute-skip as the stacked CAGRs above --
+            # _overlay_risk_checks_gt's own addon-only/core+addon combos need the same
+            # apply_addon_overlay_ground_truth pass the stacked-CAGR call already gates.
+            overlay_risk = {}
             if cand.get('phase4_eligible', True):
                 core_addon_cagr_ungated, core_drought_cagr_ungated, core_both_cagr = (
                     _stacked_overlay_cagrs_gt(trades, drought, drought_ie, years))
+                overlay_risk = _overlay_risk_checks_gt(trades, drought)
 
             core_cliff = addon['core_cliff']
             addon_cliff = addon['addon_cliff']
@@ -4181,6 +4322,11 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 'addon_detail': addon,
                 'drought': drought,
                 'drought_ie': drought_ie,
+                # Overlay-inclusive Check11/Check13 risk checks (2026-09-11 backlog item),
+                # 15 keys ({addon_only,core_addon,drought_only,core_drought,core_both}_
+                # {max_drawdown_pct,worst_fold_cagr_pct,any_fold_fragile}) -- see
+                # _overlay_risk_checks_gt's own docstring.
+                **overlay_risk,
             })
     finally:
         _trades_conn.close()

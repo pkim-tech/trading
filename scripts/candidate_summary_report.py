@@ -254,6 +254,54 @@ GT_COLUMN_DEFS = {
     "drought_combined_compounded_pct": "Drought overlay: core+drought combined compounded return.",
     "drought_skip_reason": "Set when drought was never computed for this scope at all (strategy fails "
                             "strategies.uses_arm_trail_exit()) -- see run_optimization_sweep.py's drought_skip_reason.",
+    # Overlay-inclusive Check11/Check13 risk checks (2026-09-11 -- backlog item found
+    # 2026-09-08: every check11/check13 above is CORE-only, so a promoted addon/drought
+    # node had zero drawdown/fold-fragility verification on the overlay portion of its
+    # equity curve). One (max_drawdown_pct, worst_fold_cagr_pct, any_fold_fragile,
+    # n_folds_populated) quadruple per equity curve, computed by run_optimization_sweep.
+    # _overlay_risk_checks_gt off this row's own `trades`/`drought`, folded against the
+    # SAME (start, end) time axis (the real backtest span) for every combo -- see that
+    # function's docstring for exactly what each curve is, why the 3 core-inclusive
+    # curves carry `_ungated` (a real, different curve from this row's own gated
+    # core_both_cagr_pct -- do not compare them directly), and why n_folds_populated
+    # exists (an empty check13 fold reads as "not fragile", indistinguishable from a
+    # genuinely healthy fold -- n_folds_populated < 5 means "too sparse to trust
+    # any_fold_fragile"). All four blank together for a curve with zero trades (e.g.
+    # drought_only when drought found no windows, or addon_only when no trade ever
+    # armed) or floor-breach-poisoned (core_addon_ungated/core_both_ungated only, when
+    # any blended trade's Return < -100%) -- and, same as addon_cagr_pct/
+    # core_both_cagr_pct above, blank whenever phase4_eligible is False.
+    **{f"{p}_max_drawdown_pct": f"Overlay-inclusive Check 11: max peak-to-trough compounded-equity "
+                                 f"drawdown (<=0) on the {label} equity curve."
+       for p, label in (("addon_only", "addon-only (armed-leg-only, unblended)"),
+                        ("core_addon_ungated", "core+addon (blended, UNGATED)"),
+                        ("drought_only", "drought-window-only"),
+                        ("core_drought_ungated", "core+drought (UNGATED)"),
+                        ("core_both_ungated", "core+addon+drought triple-stack (UNGATED)"))},
+    **{f"{p}_worst_fold_cagr_pct": f"Overlay-inclusive Check 13: worst of the 5 equal-time-span folds' "
+                                    f"own CAGR on the {label} equity curve, folded against the real "
+                                    f"backtest span (not this curve's own, possibly sparse, extent)."
+       for p, label in (("addon_only", "addon-only (armed-leg-only, unblended)"),
+                        ("core_addon_ungated", "core+addon (blended, UNGATED)"),
+                        ("drought_only", "drought-window-only"),
+                        ("core_drought_ungated", "core+drought (UNGATED)"),
+                        ("core_both_ungated", "core+addon+drought triple-stack (UNGATED)"))},
+    **{f"{p}_any_fold_fragile": f"Overlay-inclusive Check 13: True if any of the 5 folds on the {label} "
+                                 f"equity curve had CAGR<=GT_ROBUSTNESS_CAGR_MIN (20%) or was fully wiped "
+                                 f"out. Check {p}_n_folds_populated before trusting a False here."
+       for p, label in (("addon_only", "addon-only (armed-leg-only, unblended)"),
+                        ("core_addon_ungated", "core+addon (blended, UNGATED)"),
+                        ("drought_only", "drought-window-only"),
+                        ("core_drought_ungated", "core+drought (UNGATED)"),
+                        ("core_both_ungated", "core+addon+drought triple-stack (UNGATED)"))},
+    **{f"{p}_n_folds_populated": f"Overlay-inclusive Check 13: how many of the 5 folds on the {label} "
+                                  f"equity curve had >=1 real trade. <5 means any_fold_fragile=False may "
+                                  f"just mean 'too sparse to evaluate', not 'genuinely robust'."
+       for p, label in (("addon_only", "addon-only (armed-leg-only, unblended)"),
+                        ("core_addon_ungated", "core+addon (blended, UNGATED)"),
+                        ("drought_only", "drought-window-only"),
+                        ("core_drought_ungated", "core+drought (UNGATED)"),
+                        ("core_both_ungated", "core+addon+drought triple-stack (UNGATED)"))},
 }
 
 # Relabels find_candidates()'s internal keys to the user's requested wording
@@ -1153,6 +1201,14 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             "drought_compounded_pct": d.get("drought_compounded_pct") if d else None,
             "drought_combined_compounded_pct": d.get("combined_compounded_pct") if d else None,
             "drought_skip_reason": report.get("drought_skip_reason"),
+            # Overlay-inclusive Check11/Check13 risk checks (2026-09-11 backlog item) --
+            # already aggregate-summarized by _overlay_risk_checks_gt, threaded straight
+            # through from `row` (build_candidate_report_ground_truth's own output). The
+            # 3 core-inclusive prefixes carry `_ungated` -- see that function's docstring.
+            **{f"{p}_{s}": row.get(f"{p}_{s}")
+               for p in ("addon_only", "core_addon_ungated", "drought_only",
+                         "core_drought_ungated", "core_both_ungated")
+               for s in ("max_drawdown_pct", "worst_fold_cagr_pct", "any_fold_fragile", "n_folds_populated")},
         }
         folds = row.get("check13_folds") or []
         for f in range(1, 6):
@@ -1181,7 +1237,11 @@ _PHASE4_CHECKLIST_KEYS = [
     "drought_n_core_trades", "drought_core_compounded_pct", "drought_best_confirm_days",
     "drought_best_vol_gate", "drought_n_windows", "drought_n_simulated",
     "drought_compounded_pct", "drought_combined_compounded_pct", "drought_skip_reason",
-] + [f"check13_fold{f}_{suffix}" for f in range(1, 6) for suffix in ("n", "cagr_pct", "fragile")]
+] + [f"check13_fold{f}_{suffix}" for f in range(1, 6) for suffix in ("n", "cagr_pct", "fragile")] + [
+    f"{p}_{s}" for p in ("addon_only", "core_addon_ungated", "drought_only",
+                         "core_drought_ungated", "core_both_ungated")
+    for s in ("max_drawdown_pct", "worst_fold_cagr_pct", "any_fold_fragile", "n_folds_populated")
+]
 
 
 def _persist_phase4_verdicts_and_checklist(rows):
