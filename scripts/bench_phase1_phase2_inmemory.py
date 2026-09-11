@@ -22,6 +22,7 @@ numba-JIT-warmup cost twice and understating in-memory throughput on a small sam
 Usage: .venv/bin/python scripts/bench_phase1_phase2_inmemory.py [--workers 8]
 """
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -834,6 +835,41 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
     return len(buffer)
 
 
+_SWEEP_RUN_LOG_CREATE_SQL = """
+    CREATE TABLE IF NOT EXISTS sweep_run_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT NOT NULL, finished_at TEXT,
+        script TEXT, pid INTEGER, ticker TEXT, strategy TEXT, fixed_sl REAL,
+        windows TEXT, version TEXT,
+        n_final_candidates INTEGER, n_candidate_nodes_written INTEGER,
+        n_trade_rows_written INTEGER, elapsed_s REAL,
+        checkpoint_source TEXT, checkpoint_hash TEXT, checkpoint_path TEXT
+    )"""
+
+# checkpoint_source/checkpoint_hash/checkpoint_path added 2026-09-10 (checkpoint
+# entry_timing incident structural fix, recommendation #3) -- the real sweep_run_log
+# table on disk predates these columns (created under the old CREATE TABLE body, which
+# is a no-op against an already-existing table), so a probe-first ALTER is needed on
+# top of the CREATE TABLE above for any pre-existing DB. Mirrors campaign_registry.py's
+# own probe-first migration convention.
+def _ensure_sweep_run_log_checkpoint_columns(conn):
+    # Paired-review MEDIUM finding (2026-09-10): PRAGMA table_info + ALTER TABLE is a
+    # real TOCTOU race the first time this runs against a pre-existing DB -- two
+    # concurrent sweep processes (a real supported mode, see run_inmemory_sweep_queue.sh's
+    # own concurrent-claimer design) can both see a column missing and both ALTER; the
+    # loser hits sqlite3.OperationalError: duplicate column name and crashes at startup.
+    # Narrow, one-time window (only until the columns exist everywhere), but real --
+    # swallow the race instead of assuming it can't happen.
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(sweep_run_log)").fetchall()}
+    for col in ("checkpoint_source", "checkpoint_hash", "checkpoint_path"):
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE sweep_run_log ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e):
+                    raise
+
+
 def _log_sweep_run_start(ticker, strategy_name, fixed_sl, windows, version):
     """Real invocation log -- new table, 2026-08-29 (Task #6 piece #1, planner dispatch).
     Real gap found the same night: nobody could tell, after the fact, which sweep
@@ -849,15 +885,8 @@ def _log_sweep_run_start(ticker, strategy_name, fixed_sl, windows, version):
     separate status column, no exception handling -- keep it this simple.
     Returns the new row's id."""
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sweep_run_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at TEXT NOT NULL, finished_at TEXT,
-                script TEXT, pid INTEGER, ticker TEXT, strategy TEXT, fixed_sl REAL,
-                windows TEXT, version TEXT,
-                n_final_candidates INTEGER, n_candidate_nodes_written INTEGER,
-                n_trade_rows_written INTEGER, elapsed_s REAL
-            )""")
+        conn.execute(_SWEEP_RUN_LOG_CREATE_SQL)
+        _ensure_sweep_run_log_checkpoint_columns(conn)
         cur = conn.execute("""
             INSERT INTO sweep_run_log (started_at, script, pid, ticker, strategy, fixed_sl,
                 windows, version)
@@ -866,6 +895,23 @@ def _log_sweep_run_start(ticker, strategy_name, fixed_sl, windows, version):
               ticker, strategy_name, float(fixed_sl), ",".join(str(w) for w in windows), version))
         conn.commit()
         return cur.lastrowid
+
+
+def _log_sweep_run_checkpoint(run_id, source, checkpoint_hash, checkpoint_path):
+    """Records checkpoint provenance on the sweep_run_log row _log_sweep_run_start
+    created (2026-09-10, checkpoint entry_timing incident structural fix, recommendation
+    #3) -- called immediately after run_one_fixed_sl's load/compute decision, NOT
+    deferred to _log_sweep_run_finish, so a crash anywhere after this point still leaves
+    the real computed-vs-loaded provenance visible in sweep_run_log. Previously a
+    contaminated/reused-checkpoint run was undetectable from the DB after the fact, only
+    inferable from an anomalously small elapsed_s. `source` is 'computed' or 'loaded'."""
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        _ensure_sweep_run_log_checkpoint_columns(conn)
+        conn.execute("""
+            UPDATE sweep_run_log SET checkpoint_source=?, checkpoint_hash=?, checkpoint_path=?
+            WHERE id=?
+        """, (source, checkpoint_hash, checkpoint_path, run_id))
+        conn.commit()
 
 
 def _log_sweep_run_finish(run_id, n_final_candidates, n_candidate_nodes_written,
@@ -1452,15 +1498,23 @@ def build_arg_parser():
                           "None leaves END at its module default unchanged.")
     ap.add_argument("--checkpoint-file", default=None,
                      help="local dev-iteration checkpoint (parquet, NOT a production "
-                          "artifact) for Phase1+Phase2's combined df_full. If it exists, "
-                          "skips Phase1 AND Phase2 entirely and loads df_full from it -- "
-                          "for iterating on Phase2.5 logic without repaying the ~7min "
-                          "Phase1+Phase2 cost each time. If missing, computes normally "
-                          "and saves it after Phase2 finishes. Default: "
+                          "artifact) for Phase1+Phase2's combined df_full, PLUS a "
+                          "<path>.manifest.json sidecar with the full resolved param dict "
+                          "(2026-09-10: content-hashed identity, hard-refuses to load on a "
+                          "mismatch or missing manifest -- see _checkpoint_identity_params). "
+                          "If it exists and validates, skips Phase1 AND Phase2 entirely and "
+                          "loads df_full from it -- for iterating on Phase2.5 logic without "
+                          "repaying the ~7min Phase1+Phase2 cost each time. If missing, "
+                          "computes normally and saves both files after Phase2 finishes. "
+                          "Default (see --use-checkpoint below): "
                           "<job-tmp>/bench_phase12_checkpoint_<ticker>_<strategy>_<fixed_sl>_"
-                          "w<windows>_<date-range-suffix>.parquet (mutually exclusive with "
-                          "--resume-from-top100 AND with --seed-watch-list-id). Explicitly "
-                          "passing this flag is itself the opt-in this run needs to load a "
+                          "<content_hash16>.parquet -- ONE SHARED PATH ACROSS --fixed-sl-"
+                          "values (unlike the auto-computed default, which is naturally "
+                          "distinct per fixed_sl since fixed_sl is part of the hash), so "
+                          "this flag is rejected outright at parse time for a run covering "
+                          "more than one fixed_sl (mutually exclusive with --resume-from-"
+                          "top100 AND with --seed-watch-list-id too). Explicitly passing "
+                          "this flag is itself the opt-in this run needs to load a "
                           "checkpoint at all -- see --use-checkpoint below for the "
                           "auto-computed-default-path equivalent.")
     ap.add_argument("--use-checkpoint", action="store_true",
@@ -1662,6 +1716,28 @@ def main():
         fixed_sl_list = [node["fixed_sl"]]
         print(f"Live node: strategy={strategy_name}, fixed_sl={fixed_sl_list[0]}")
 
+    if args.checkpoint_file and len(fixed_sl_list) > 1:
+        # Paired-review HIGH finding (2026-09-10, checkpoint content-hash structural fix):
+        # an explicit --checkpoint-file path does NOT vary per fixed_sl (unlike the
+        # auto-computed default path, which is hash-derived and therefore naturally
+        # distinct per fixed_sl) -- but fixed_sl IS part of the checkpoint identity hash
+        # (_checkpoint_identity_params). Without this guard, fixed_sl_list[0] would
+        # compute+save under the shared path, then fixed_sl_list[1] would find that file,
+        # see a hash mismatch, and _validate_checkpoint_manifest would hard-raise,
+        # killing the whole multi-fixed_sl run. That hard-raise is the gate working as
+        # designed (the OLD code silently loaded fixed_sl[0]'s df_full for every
+        # subsequent fixed_sl instead) -- but failing at argv-parse time with a clear
+        # message is much better than failing mid-run after fixed_sl[0]'s candidates are
+        # already written. Real invocation path: run_inmemory_sweep_queue.sh can pass
+        # --checkpoint-file alongside a multi-value --fixed-sl-values CSV if an operator
+        # sets CHECKPOINT_FILE explicitly (the default USE_CHECKPOINT=1 form is unaffected
+        # -- its auto-computed path already varies per fixed_sl).
+        raise SystemExit(
+            f"--checkpoint-file is a single shared path but this run covers {len(fixed_sl_list)} "
+            f"fixed_sl values ({fixed_sl_list}) -- each needs its own checkpoint identity. Use "
+            f"--use-checkpoint instead (auto-computed, hash-derived path, one per fixed_sl), or "
+            f"invoke this script once per fixed_sl with its own --checkpoint-file each time.")
+
     # version depends only on DATA_SOURCE/START/END (not fixed_sl) -- computed ONCE and
     # reused across every fixed_sl in the loop below, matching the real established
     # convention already confirmed against live data (scripts/candidate_nodes_status.py):
@@ -1711,15 +1787,8 @@ def main():
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         for fixed_sl in fixed_sl_list:
             with sqlite3.connect(DB_PATH, timeout=60.0) as _conn:
-                _conn.execute("""
-                    CREATE TABLE IF NOT EXISTS sweep_run_log (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        started_at TEXT NOT NULL, finished_at TEXT,
-                        script TEXT, pid INTEGER, ticker TEXT, strategy TEXT, fixed_sl REAL,
-                        windows TEXT, version TEXT,
-                        n_final_candidates INTEGER, n_candidate_nodes_written INTEGER,
-                        n_trade_rows_written INTEGER, elapsed_s REAL
-                    )""")
+                _conn.execute(_SWEEP_RUN_LOG_CREATE_SQL)
+                _ensure_sweep_run_log_checkpoint_columns(_conn)
                 # Seed mode bypasses this dedup check entirely (2026-08-29, paired review
                 # round 3, contextual): the "-seed<id>" version suffix alone only solved
                 # cross-contamination with real full-grid campaigns, it did NOT achieve
@@ -1743,68 +1812,155 @@ def main():
             run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args)
 
 
-def _build_checkpoint_filename(strategy_name, fixed_sl, args):
+def _resolve_checkpoint_grid(strategy_name, take_profits, stop_losses, trail_pcts, hold_time_caps):
+    """Fills in any grid axis left as None by resolving it from
+    campaign_config.STRATEGIES[strategy_name] / module HOLD_TIME_CAPS -- the same
+    source run_one_fixed_sl itself uses (see its own TAKE_PROFITS/STOP_LOSSES/
+    TRAIL_PCTS local vars). Lets the real call site pass its already-resolved
+    values in directly (no recomputation, no drift risk) while other callers
+    (tests, ad hoc introspection) can omit them and still get a correct default."""
+    grid = campaign_config.STRATEGIES[strategy_name]
+    if take_profits is None:
+        take_profits = grid["take_profits"]
+    if stop_losses is None:
+        stop_losses = grid["stop_losses"]
+    if trail_pcts is None:
+        trail_pcts = _trail_pcts_for_strategy(strategy_name, grid)
+    if hold_time_caps is None:
+        hold_time_caps = HOLD_TIME_CAPS
+    return take_profits, stop_losses, trail_pcts, hold_time_caps
+
+
+def _checkpoint_identity_params(strategy_name, fixed_sl, args, take_profits=None,
+                                 stop_losses=None, trail_pcts=None, hold_time_caps=None):
+    """The full resolved param set that determines Phase1/Phase2's real output for this
+    run -- see docs/backlog_cache.md's 'checkpoint entry_timing incident' architectural
+    item (2026-09-01, HIGH). Replaces the old hand-maintained filename-key allowlist
+    (_build_checkpoint_filename previously grew a new hand-written "_<axis>_key" string
+    fragment after each of 6 separate real live incidents: WINDOWS, Z_THRESHOLDS, date
+    range, TICKER/seed_watch_list_id, N_ISLANDS, PROMOTION_ALGO_VERSION, ENTRY_TIMING)
+    with a single param dict that gets content-hashed for the checkpoint's real identity
+    (_checkpoint_identity_hash) -- both recommendations #1/#2 from that review. Adding a
+    new axis that affects Phase1/Phase2's output in the future means adding one line to
+    this dict, not inventing a new filename fragment and hoping every future reviewer
+    remembers the pattern (the review's own words: "the pattern guarantees a seventh").
+
+    Every value is read from the ACTUAL resolved state, not from args alone -- module
+    globals (TICKER/WINDOWS/Z_THRESHOLDS/ENTRY_TIMING/N_ISLANDS) may already reflect a
+    seed-mode or CLI-override value by the time this runs (main()'s apply_grid_overrides()
+    and the --seed-watch-list-id block both mutate these globals before run_one_fixed_sl
+    is ever called for real work) -- so this can't drift from what Phase1 tasks are
+    actually built from. take_profits/stop_losses/trail_pcts/hold_time_caps also close
+    the separate, related gap flagged in the same paired review (docs/backlog_cache.md's
+    "checkpoint filename doesn't key on campaign_config.py's grid contents" entry):
+    editing COMBINED/TRAIL_PCTS in campaign_config.py now changes the hash too, since the
+    resolved grid tuple is part of what's hashed, not just strategy_name.
+
+    n_generations/fine_radius added by independent-cold paired review (2026-09-10): both
+    change which real Phase2 cells get computed into df_full (N_GENERATIONS controls the
+    island-reseeding pass count; FINE_RADIUS sets the Phase2 mesh box half-width), and
+    PROMOTION_ALGO_VERSION's own contract explicitly says NOT to bump for a sweep-scope
+    parameter change like this (pointing instead at "its own -z/-isl/-seed suffix" -- the
+    exact per-axis mechanism this hash replaces), so relying on a human remembering to
+    bump PROMOTION_ALGO_VERSION here would NOT have covered them -- neither is a CLI
+    override today, but hashing them now closes the gap unconditionally rather than by
+    convention."""
+    take_profits, stop_losses, trail_pcts, hold_time_caps = _resolve_checkpoint_grid(
+        strategy_name, take_profits, stop_losses, trail_pcts, hold_time_caps)
+    return {
+        "strategy_name": strategy_name,
+        "fixed_sl": float(fixed_sl),
+        "ticker": TICKER,
+        "data_source": DATA_SOURCE,
+        "start": START,
+        "end": END,
+        "windows": sorted(WINDOWS),
+        "z_thresholds": sorted(Z_THRESHOLDS),
+        "hold_time_caps": sorted(hold_time_caps),
+        "take_profits": sorted(take_profits),
+        "stop_losses": sorted(stop_losses),
+        "trail_pcts": sorted(trail_pcts),
+        "seed_watch_list_id": getattr(args, "seed_watch_list_id", None),
+        "n_islands": N_ISLANDS,
+        "n_generations": N_GENERATIONS,
+        "fine_radius": FINE_RADIUS,
+        "promotion_algo_version": PROMOTION_ALGO_VERSION,
+        "entry_timing": ENTRY_TIMING,
+    }
+
+
+def _checkpoint_identity_hash(params):
+    """Deterministic hash over the resolved param dict -- sort_keys means key
+    order/insertion order never affects the hash. sha256 truncated to 16 hex chars
+    (collision risk is irrelevant here: this is an identity check against a
+    human-readable sidecar manifest, not a security boundary, and the manifest's own
+    full params dict is the real source of truth _validate_checkpoint_manifest checks
+    against, not the hash alone)."""
+    blob = json.dumps(params, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def _build_checkpoint_filename(strategy_name, fixed_sl, args, take_profits=None,
+                                stop_losses=None, trail_pcts=None, hold_time_caps=None):
     """Builds the dev-iteration checkpoint filename, extracted (2026-08-29, paired-review
     fixup) out of run_one_fixed_sl so it's directly unit-testable without a real DB/backtest
-    run. Depends on module-level TICKER/WINDOWS/Z_THRESHOLDS/START/END plus the override
-    flags on args."""
-    # Keyed on WINDOWS too (not just strategy/fixed_sl) -- found live 2026-08-29: a
-    # --window override run silently loaded a stale checkpoint from an earlier
-    # standard-grid ([10,20]) run under the same strategy/fixed_sl, skipping Phase1+2
-    # entirely and never actually computing the overridden window at all. The checkpoint
-    # itself is explicitly documented as a "dev-iteration" convenience, not a production
-    # artifact -- this key just makes that convenience safe to use across different grids.
-    _windows_key = "-".join(str(w) for w in WINDOWS)
-    # Keyed on Z_THRESHOLDS too -- same bug class as the WINDOWS key: a --z-thresholds
-    # override run must not silently load a checkpoint from an earlier run under the
-    # standard z grid (or a different z grid) with the same strategy/fixed_sl/windows.
-    _z_key = "z" + "-".join(str(z) for z in Z_THRESHOLDS) if args.z_thresholds is not None else ""
-    # Also keyed on the date range (not just WINDOWS) -- same bug class as the WINDOWS key
-    # above: a full-range run's checkpoint must not get silently loaded by a later
-    # short-range --start-date/--end-date smoke-test run (or vice versa).
-    _range_key = window_version_suffix(START, END)
-    # Also keyed on TICKER + the seed watch_list id (2026-08-29, paired review): seed mode
-    # mutates the module-level TICKER global (previously immutable across a whole run), so
-    # two different seed nodes sharing (strategy, fixed_sl, windows, date-range) but
-    # different tickers would otherwise collide on the same checkpoint path -- silently
-    # loading one ticker's df_full and promoting it under another ticker's version.
-    _seed_key = f"_seed{args.seed_watch_list_id}" if getattr(args, "seed_watch_list_id", None) \
-        is not None else ""
-    # Also keyed on N_ISLANDS -- same bug class as the WINDOWS/Z_THRESHOLDS keys above: an
-    # --n-islands override run must not silently load a checkpoint from an earlier run under
-    # a different island count with the same strategy/fixed_sl/windows/date-range.
-    _isl_key = f"_isl{args.n_islands}" if args.n_islands is not None else ""
-    # Also keyed on PROMOTION_ALGO_VERSION (2026-08-31, planner dispatch, paired-review
-    # HIGH finding): this checkpoint stores df_full -- the full Phase1+Phase2 evidence
-    # pool -- and loading it SKIPS Phase1 AND Phase2 entirely, including the whole
-    # N_GENERATIONS multi-generation loop. Without this key, a stale pre-pv4 checkpoint
-    # (single Phase2-island pass) would silently load under the new pv4 code and get
-    # promoted as if it were a real multi-generation result -- confirmed live: 153 stale
-    # checkpoints from the single-pass code were sitting in the checkpoint dir with
-    # otherwise-identical keys at the time this fix landed. Same bug class, same fix
-    # shape, as the WINDOWS/Z_THRESHOLDS/N_ISLANDS keys above -- this one auto-resolves
-    # every FUTURE PROMOTION_ALGO_VERSION bump too, not just this one.
-    _pv_key = f"_pv{PROMOTION_ALGO_VERSION}"
-    # Also keyed on ENTRY_TIMING -- same bug class as every key above: Phase1/Phase2's
-    # own dispatch passes ENTRY_TIMING into the real signal/fill computation (see
-    # _dispatch's task tuple), so a checkpoint computed under one entry_timing is NOT
-    # valid for another. Found live 2026-09-01: a fresh --entry-timing close run for
-    # SOXL/TrailingBoth/fixed_sl=1 silently loaded an open_check checkpoint left over
-    # from the prior evening's real v6.5 campaign run (same ticker/strategy/fixed_sl/
-    # windows/z/date-range/isl/pv) and skipped Phase1+Phase2 entirely. The run's
-    # ORPHANED ProcessPoolExecutor workers (parent killed, workers not -- same "SIGTERM
-    # doesn't propagate to a pool" class as a documented 2026-08-22/2026-08-31 incident)
-    # kept executing pre-fix code for several more minutes after this fix was written
-    # and committed, until caught live and killed directly by pid. Real candidate_nodes/
-    # backtest_phase1_insurance rows were confirmed NEVER written under the v6.6 version
-    # throughout -- caught before any DB contamination, not after. ENTRY_TIMING defaults
-    # to 'open_check' (module default, matches every pre-existing checkpoint on disk
-    # with no key needed for that case) so this only adds a suffix for a genuine
-    # close-entry run, keeping every existing open_check checkpoint's filename
-    # byte-identical.
-    _entry_timing_key = f"_{ENTRY_TIMING}" if ENTRY_TIMING != "open_check" else ""
-    return (f"bench_phase12_checkpoint_{TICKER}_{strategy_name}_{fixed_sl}_w{_windows_key}"
-            f"{_z_key}{_range_key}{_seed_key}{_isl_key}{_pv_key}{_entry_timing_key}.parquet")
+    run. Content-hashed (2026-09-10 structural fix) rather than built from a hand-maintained
+    key-list -- see _checkpoint_identity_params' docstring. The TICKER/strategy_name/fixed_sl
+    prefix is kept purely for human skimmability of a checkpoint directory listing; the hash
+    suffix is what actually determines whether two runs' checkpoints collide or not."""
+    params = _checkpoint_identity_params(strategy_name, fixed_sl, args, take_profits,
+                                          stop_losses, trail_pcts, hold_time_caps)
+    content_hash = _checkpoint_identity_hash(params)
+    return f"bench_phase12_checkpoint_{TICKER}_{strategy_name}_{fixed_sl}_{content_hash}.parquet"
+
+
+def _checkpoint_manifest_path(checkpoint_path):
+    return checkpoint_path + ".manifest.json"
+
+
+def _write_checkpoint_manifest(checkpoint_path, params, content_hash):
+    """Human-readable sidecar written alongside every saved checkpoint (2026-09-10
+    structural fix, recommendation #2) -- a bare hash in the filename is opaque; this
+    manifest is what an operator or a future debugging session actually reads to see
+    WHY a given checkpoint file is considered valid for its filename. It's also what
+    _validate_checkpoint_manifest checks on load, as defense-in-depth beyond the
+    filename's own self-encoded hash -- an explicit --checkpoint-file path is a
+    human-supplied filename that does NOT self-encode a hash at all, so this manifest
+    is the ONLY identity check that path ever gets."""
+    manifest = {"content_hash": content_hash, "params": params,
+                "written_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    with open(_checkpoint_manifest_path(checkpoint_path), "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True, default=str)
+
+
+def _validate_checkpoint_manifest(checkpoint_path, params, content_hash):
+    """Hard-refuse-on-mismatch gate (2026-09-10 structural fix, recommendation #2 from
+    the checkpoint entry_timing incident review: "replace the filename allowlist with a
+    content hash... validated on load with a hard refuse-on-mismatch"). A checkpoint
+    file existing under the expected content-hashed default filename is already strong
+    evidence of a match (the filename IS derived from the hash), but this revalidates
+    against a written manifest as defense-in-depth -- e.g. an explicit --checkpoint-file
+    path is a human-supplied filename that does not self-encode a hash, so this is the
+    only identity check that path ever gets. Raises RuntimeError -- never silently
+    recomputes or falls through -- on a missing manifest (unverifiable, treated the same
+    as a real mismatch) or a hash mismatch."""
+    manifest_path = _checkpoint_manifest_path(checkpoint_path)
+    if not os.path.exists(manifest_path):
+        raise RuntimeError(
+            f"Checkpoint manifest missing: {manifest_path!r} -- refusing to load "
+            f"{checkpoint_path!r} without provenance. Delete the checkpoint file and "
+            f"re-run (fresh compute + a real manifest), or restore the manifest if it "
+            f"was deleted by mistake.")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    if manifest.get("content_hash") != content_hash:
+        raise RuntimeError(
+            f"Checkpoint identity mismatch for {checkpoint_path!r}: manifest hash "
+            f"{manifest.get('content_hash')!r} != this run's resolved hash {content_hash!r}. "
+            f"manifest params={manifest.get('params')} vs this run's params={params}. "
+            f"Refusing to load a checkpoint that doesn't match this run's real resolved "
+            f"parameters -- see docs/backlog_cache.md's 'checkpoint entry_timing incident' "
+            f"architectural item.")
 
 
 def _should_load_checkpoint(args, seed_task, checkpoint_path):
@@ -1860,7 +2016,17 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
 
     _job_tmp = os.path.join(os.environ["CLAUDE_JOB_DIR"], "tmp") if "CLAUDE_JOB_DIR" in os.environ else "/tmp"
     checkpoint_path = args.checkpoint_file or os.path.join(
-        _job_tmp, _build_checkpoint_filename(strategy_name, fixed_sl, args))
+        _job_tmp, _build_checkpoint_filename(strategy_name, fixed_sl, args,
+                                              TAKE_PROFITS, STOP_LOSSES, TRAIL_PCTS))
+    # Resolved once here (not re-derived at load/save time) so the load-time validation
+    # and the save-time manifest are guaranteed to agree on what this run's real identity
+    # is, even though seed mode later locally reassigns TAKE_PROFITS/TRAIL_PCTS below --
+    # moot for seed mode specifically since it never loads/saves a checkpoint at all (see
+    # _should_load_checkpoint/_should_save_checkpoint), but keeping one resolved value
+    # avoids a second, potentially-diverging recomputation entirely.
+    _checkpoint_params = _checkpoint_identity_params(strategy_name, fixed_sl, args,
+                                                      TAKE_PROFITS, STOP_LOSSES, TRAIL_PCTS)
+    _checkpoint_hash = _checkpoint_identity_hash(_checkpoint_params)
 
     asset_bh, spy_bh = compute_bh_returns(TICKER, start_date=START, end_date=END, data_source=DATA_SOURCE)
     if spy_bh is None:
@@ -1958,15 +2124,24 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # this script registers a real campaign row (main()'s unconditional register_campaign
     # call, no separate 'just testing' mode exists) -- so 'opt-in for any run registering a
     # real campaign' means every default-path load now requires an explicit ask.
+    _checkpoint_saved = False  # overridden True only if the compute branch's save fires
     if _should_load_checkpoint(args, _seed_task, checkpoint_path):
+      # Hard-refuse-on-mismatch gate (2026-09-10 structural fix) -- raises before any
+      # read if the manifest is missing or its hash doesn't match this run's real
+      # resolved params. Replaces the old "filename existing is proof enough" trust
+      # model that caused the entry_timing incident.
+      _validate_checkpoint_manifest(checkpoint_path, _checkpoint_params, _checkpoint_hash)
+      _checkpoint_source = "loaded"
       t0 = time.time()
       df_full = pd.read_parquet(checkpoint_path)
       t1 = t2 = t3 = time.time()
       phase1_rows, phase2_rows = [], []  # total-cells-computed count below stays honest
       print(f"CHECKPOINT: loaded df_full ({len(df_full):,} rows, deduped Phase1+Phase2) "
             f"from {checkpoint_path} in {t1 - t0:.2f}s -- skipping Phase1 AND Phase2 "
-            f"dispatch entirely (dev-iteration checkpoint, NOT a production artifact).")
+            f"dispatch entirely (dev-iteration checkpoint, NOT a production artifact). "
+            f"Manifest hash validated: {_checkpoint_hash}.")
     else:
+      _checkpoint_source = "computed"
       if args.resume_from_top100:
           t0 = time.time()
           with sqlite3.connect(DB_PATH) as conn:
@@ -2293,15 +2468,46 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       # derived from the deliberately-crippled top-100-only pool into candidate_nodes.
       # resume-from-top100's own df_full has no legitimate reason to ever be cached.
       if _should_save_checkpoint(args, _seed_task):
+          # Manifest written BEFORE the parquet (paired-review LOW finding: the reverse
+          # order risks a kill leaving an orphaned parquet with no manifest, which every
+          # future run would then hard-refuse to load until manually deleted). This order
+          # is self-healing instead: a kill between the two leaves a manifest but no
+          # parquet, so _should_load_checkpoint's os.path.exists(checkpoint_path) check on
+          # the PARQUET still correctly reports "nothing to load" and the next run just
+          # recomputes and overwrites both files cleanly.
           os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+          _write_checkpoint_manifest(checkpoint_path, _checkpoint_params, _checkpoint_hash)
           df_full.to_parquet(checkpoint_path)
-          print(f"Checkpoint saved: {checkpoint_path} ({len(df_full):,} rows)")
+          _checkpoint_saved = True
+          print(f"Checkpoint saved: {checkpoint_path} ({len(df_full):,} rows, "
+                f"manifest hash {_checkpoint_hash}).")
       elif _seed_task is not None:
           print("Seed mode: checkpoint save skipped (always re-runs Phase1+Phase2 for real).")
       else:
           print("--resume-from-top100: checkpoint save skipped (df_full built from a "
                 "pre-filtered top-100 snapshot, not the full grid -- must never overwrite "
                 "the shared default checkpoint path a real full-campaign run would load).")
+
+    # Checkpoint provenance record (2026-09-10 structural fix, recommendation #3 from the
+    # checkpoint entry_timing incident review): recorded immediately here, not deferred to
+    # _log_sweep_run_finish, so a crash anywhere after this point still leaves the real
+    # computed-vs-loaded provenance visible in sweep_run_log -- a contaminated/reused-
+    # checkpoint run was previously undetectable from the DB after the fact, only
+    # inferable from an anomalously small elapsed_s.
+    #
+    # checkpoint_hash/checkpoint_path are only recorded when a checkpoint was ACTUALLY
+    # loaded or saved (paired-review MEDIUM finding: seed mode and --resume-from-top100
+    # both skip load AND save entirely, and in seed mode the hash would additionally
+    # reflect the pre-seed-override TAKE_PROFITS/TRAIL_PCTS, not the seed's real pinned
+    # values -- logging it anyway would falsely group a seed/narrowed-pool run with an
+    # unrelated real full-grid run under the same checkpoint_hash in a future forensic
+    # query). checkpoint_source stays 'computed' either way -- that part is literally
+    # accurate (Phase1/Phase2 genuinely ran) regardless of whether the result got cached.
+    _checkpoint_used = _checkpoint_source == "loaded" or _checkpoint_saved
+    _log_sweep_run_checkpoint(
+        _run_log_id, _checkpoint_source,
+        _checkpoint_hash if _checkpoint_used else None,
+        checkpoint_path if _checkpoint_used else None)
 
     # --- Everything below runs regardless of which branch built df_full ---
 

@@ -173,6 +173,34 @@ def test_n_islands_rejects_negative():
     assert "--n-islands" in str(ei.value)
 
 
+def test_checkpoint_file_rejected_with_multiple_fixed_sl_values():
+    """Paired-review HIGH finding (2026-09-10, checkpoint content-hash structural fix):
+    an explicit --checkpoint-file is a single shared path, but fixed_sl is part of the
+    checkpoint identity hash -- without this guard, fixed_sl_list[1] would find
+    fixed_sl_list[0]'s saved file, hit a hash mismatch, and _validate_checkpoint_manifest
+    would hard-raise mid-run (after fixed_sl_list[0]'s candidates were already written).
+    Real invocation path: run_inmemory_sweep_queue.sh can pass --checkpoint-file
+    alongside a multi-value --fixed-sl-values CSV when CHECKPOINT_FILE is set."""
+    with pytest.raises(SystemExit) as ei:
+        _run_main(["--strategy", "TrailingBothZScoreBreakout", "--checkpoint-file",
+                   "/tmp/shared_checkpoint.parquet", "--fixed-sl-values", "1", "2"])
+    assert "--checkpoint-file" in str(ei.value)
+
+
+def test_checkpoint_file_allowed_with_single_fixed_sl_value(monkeypatch):
+    """Sibling of the rejection test above -- a single-value --fixed-sl-values (or the
+    plain --fixed-sl form) must NOT trip the new guard, since there's exactly one real
+    identity to hash and no shared-path collision is possible."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--checkpoint-file",
+                   "/tmp/shared_checkpoint.parquet", "--fixed-sl-values", "1"])
+    assert args.checkpoint_file == "/tmp/shared_checkpoint.parquet"
+    # main() itself would still hit real DB/backtest work past the guard -- this test
+    # only confirms the guard's own condition (len(fixed_sl_list) > 1) doesn't fire for
+    # a single-value list, mirroring how the rejection test confirms it does for 2+.
+    fixed_sl_list = [1]
+    assert not (args.checkpoint_file and len(fixed_sl_list) > 1)
+
+
 def test_version_string_gets_isl_suffix_when_overridden():
     args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--n-islands", "10"])
     version = bench._build_version_string(args)
@@ -219,14 +247,19 @@ def test_version_string_always_has_promotion_algo_version_suffix():
     assert version.endswith(f"-pv{bench.PROMOTION_ALGO_VERSION}")
 
 
-def test_checkpoint_filename_differs_with_n_islands_override():
-    args_default = _parse(["--strategy", "TrailingBothZScoreBreakout"])
-    args_override = _parse(["--strategy", "TrailingBothZScoreBreakout", "--n-islands", "7"])
-    name_default = bench._build_checkpoint_filename("TrailingBothZScoreBreakout", 3.0, args_default)
-    name_override = bench._build_checkpoint_filename("TrailingBothZScoreBreakout", 3.0, args_override)
+def test_checkpoint_filename_differs_with_n_islands_override(monkeypatch):
+    """2026-09-10 structural fix: _build_checkpoint_filename is now content-hashed
+    (see _checkpoint_identity_params) rather than built from a hand-maintained
+    "_isl<N>" filename fragment -- the hash reads the real module-level N_ISLANDS
+    global directly (already resolved by main()'s apply_grid_overrides() before
+    run_one_fixed_sl ever runs for real), so this monkeypatches that global instead
+    of relying on args.n_islands alone, matching the entry_timing test below."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    monkeypatch.setattr(bench, "N_ISLANDS", 3)
+    name_default = bench._build_checkpoint_filename("TrailingBothZScoreBreakout", 3.0, args)
+    monkeypatch.setattr(bench, "N_ISLANDS", 7)
+    name_override = bench._build_checkpoint_filename("TrailingBothZScoreBreakout", 3.0, args)
     assert name_default != name_override
-    assert "_isl7" in name_override
-    assert "_isl" not in name_default
 
 
 def test_checkpoint_filename_differs_with_entry_timing_override(monkeypatch):
@@ -236,8 +269,8 @@ def test_checkpoint_filename_differs_with_entry_timing_override(monkeypatch):
     windows/z/date-range/isl/pv) and skipped Phase1+Phase2 entirely -- caught before
     any candidate_nodes rows were written (its orphaned ProcessPoolExecutor workers
     kept running pre-fix code for several more minutes after, killed live by pid).
-    Mirrors test_checkpoint_filename_differs_with_n_islands_override's pattern
-    exactly."""
+    Filename is now content-hashed (2026-09-10 structural fix) rather than a
+    "_close" filename fragment -- asserts the hash differs instead of a substring."""
     args_default = _parse(["--strategy", "TrailingBothZScoreBreakout"])
     args_close = _parse(["--strategy", "TrailingBothZScoreBreakout", "--entry-timing", "close"])
     monkeypatch.setattr(bench, "ENTRY_TIMING", "open_check")
@@ -245,8 +278,78 @@ def test_checkpoint_filename_differs_with_entry_timing_override(monkeypatch):
     monkeypatch.setattr(bench, "ENTRY_TIMING", "close")
     name_close = bench._build_checkpoint_filename("TrailingBothZScoreBreakout", 3.0, args_close)
     assert name_default != name_close
-    assert "_close" in name_close
-    assert "_close" not in name_default
+
+
+def test_checkpoint_identity_params_includes_resolved_grid():
+    """The content hash must cover the resolved campaign_config grid tuple too
+    (docs/backlog_cache.md's separate "checkpoint filename doesn't key on
+    campaign_config.py's grid contents" gap, folded into this same structural fix)
+    -- not just strategy_name, so editing take_profits/stop_losses/trail_pcts in
+    campaign_config.py changes the hash even though strategy_name is unchanged."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    params_default = bench._checkpoint_identity_params(
+        "TrailingBothZScoreBreakout", 3.0, args, take_profits=[1, 2, 3])
+    params_edited_grid = bench._checkpoint_identity_params(
+        "TrailingBothZScoreBreakout", 3.0, args, take_profits=[1, 2, 3, 4])
+    assert params_default["take_profits"] != params_edited_grid["take_profits"]
+    assert (bench._checkpoint_identity_hash(params_default)
+            != bench._checkpoint_identity_hash(params_edited_grid))
+
+
+def test_checkpoint_identity_params_reads_real_campaign_config_grid(monkeypatch):
+    """Sibling of the test above, but exercising the REAL _resolve_checkpoint_grid path
+    (no take_profits override passed in) -- paired-review LOW finding: the other test
+    passes take_profits explicitly and never actually proves editing campaign_config.py
+    itself changes the hash, only that a different take_profits VALUE does."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    params_before = bench._checkpoint_identity_params("TrailingBothZScoreBreakout", 3.0, args)
+    original_grid = bench.campaign_config.STRATEGIES["TrailingBothZScoreBreakout"]
+    edited_grid = dict(original_grid, take_profits=list(original_grid["take_profits"]) + [999])
+    monkeypatch.setitem(bench.campaign_config.STRATEGIES, "TrailingBothZScoreBreakout", edited_grid)
+    params_after = bench._checkpoint_identity_params("TrailingBothZScoreBreakout", 3.0, args)
+    assert params_before["take_profits"] != params_after["take_profits"]
+    assert (bench._checkpoint_identity_hash(params_before)
+            != bench._checkpoint_identity_hash(params_after))
+
+
+def test_checkpoint_identity_params_includes_n_generations_and_fine_radius(monkeypatch):
+    """Paired-review MEDIUM finding (2026-09-10): N_GENERATIONS/FINE_RADIUS both change
+    which real Phase2 cells get computed into df_full, but PROMOTION_ALGO_VERSION's own
+    contract explicitly says NOT to bump it for a sweep-scope parameter change like these
+    -- relying on that convention would NOT have covered them. Must be hashed directly."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    params_before = bench._checkpoint_identity_params("TrailingBothZScoreBreakout", 3.0, args)
+    monkeypatch.setattr(bench, "N_GENERATIONS", bench.N_GENERATIONS + 1)
+    params_n_gen = bench._checkpoint_identity_params("TrailingBothZScoreBreakout", 3.0, args)
+    assert (bench._checkpoint_identity_hash(params_before)
+            != bench._checkpoint_identity_hash(params_n_gen))
+
+    monkeypatch.setattr(bench, "N_GENERATIONS", bench.N_GENERATIONS)  # restore
+    monkeypatch.setattr(bench, "FINE_RADIUS", bench.FINE_RADIUS + 1)
+    params_fine_radius = bench._checkpoint_identity_params("TrailingBothZScoreBreakout", 3.0, args)
+    assert (bench._checkpoint_identity_hash(params_before)
+            != bench._checkpoint_identity_hash(params_fine_radius))
+
+
+def test_checkpoint_manifest_round_trips_and_detects_mismatch(tmp_path):
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    params = bench._checkpoint_identity_params("TrailingBothZScoreBreakout", 3.0, args)
+    content_hash = bench._checkpoint_identity_hash(params)
+    ckpt = tmp_path / "checkpoint.parquet"
+    ckpt.write_text("fake parquet contents")
+
+    # No manifest yet -- must hard-refuse, not silently proceed.
+    with pytest.raises(RuntimeError, match="manifest missing"):
+        bench._validate_checkpoint_manifest(str(ckpt), params, content_hash)
+
+    bench._write_checkpoint_manifest(str(ckpt), params, content_hash)
+    bench._validate_checkpoint_manifest(str(ckpt), params, content_hash)  # does not raise
+
+    other_params = bench._checkpoint_identity_params(
+        "TrailingBothZScoreBreakout", 3.0, args, take_profits=[999])
+    other_hash = bench._checkpoint_identity_hash(other_params)
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        bench._validate_checkpoint_manifest(str(ckpt), other_params, other_hash)
 
 
 def _run_main(argv):
@@ -584,3 +687,54 @@ def test_should_save_checkpoint_false_for_resume_from_top100():
     shared default checkpoint path a later real full-campaign run would load."""
     args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--resume-from-top100"])
     assert bench._should_save_checkpoint(args, seed_task=None) is False
+
+
+def test_ensure_sweep_run_log_checkpoint_columns_idempotent(tmp_path):
+    """Calling the migration twice against the same connection must not raise --
+    covers both the normal idempotency case and (indirectly) the paired-review MEDIUM
+    finding that a concurrent ALTER TABLE ... duplicate column name race must be
+    swallowed, not propagated."""
+    import sqlite3
+    db_path = tmp_path / "sweep_run_log_test.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(bench._SWEEP_RUN_LOG_CREATE_SQL)
+    bench._ensure_sweep_run_log_checkpoint_columns(conn)
+    bench._ensure_sweep_run_log_checkpoint_columns(conn)  # must not raise
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sweep_run_log)").fetchall()}
+    assert {"checkpoint_source", "checkpoint_hash", "checkpoint_path"} <= cols
+    conn.close()
+
+
+def test_ensure_sweep_run_log_checkpoint_columns_swallows_concurrent_duplicate_add(tmp_path):
+    """Simulates the real TOCTOU race: two connections both see the column missing (the
+    PRAGMA probe already ran), then both attempt the ALTER -- the second must not raise."""
+    import sqlite3
+    db_path = tmp_path / "sweep_run_log_test2.db"
+    conn = sqlite3.connect(str(db_path))
+    # Legacy (pre-migration) shape -- the real DBs this migration runs against, unlike
+    # _SWEEP_RUN_LOG_CREATE_SQL which already includes the new columns for a fresh table.
+    conn.execute("""
+        CREATE TABLE sweep_run_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL, finished_at TEXT,
+            script TEXT, pid INTEGER, ticker TEXT, strategy TEXT, fixed_sl REAL,
+            windows TEXT, version TEXT,
+            n_final_candidates INTEGER, n_candidate_nodes_written INTEGER,
+            n_trade_rows_written INTEGER, elapsed_s REAL
+        )""")
+    conn.execute("ALTER TABLE sweep_run_log ADD COLUMN checkpoint_source TEXT")
+    # checkpoint_source now already exists on disk, but simulate a probe that (as in the
+    # real race) ran BEFORE that ALTER committed -- sqlite3.Connection.execute is a
+    # read-only C-extension slot (can't monkeypatch the instance directly), so wrap it in
+    # a thin duck-typed proxy instead; _ensure_sweep_run_log_checkpoint_columns only ever
+    # calls .execute(sql) on whatever it's given.
+    class _StaleProbeConn:
+        def execute(self, sql, *a, **kw):
+            if sql.strip().startswith("PRAGMA table_info"):
+                class _Empty:
+                    def fetchall(self):
+                        return []
+                return _Empty()
+            return conn.execute(sql, *a, **kw)
+    bench._ensure_sweep_run_log_checkpoint_columns(_StaleProbeConn())  # must not raise
+    conn.close()

@@ -217,6 +217,14 @@ CAMPAIGN_LABEL="${CAMPAIGN_LABEL:-}"
 # ORs them, `args.checkpoint_file or args.use_checkpoint`) -- neither conflicts with the
 # other, only with --resume-from-top100/--seed-watch-list-id (bench's own real mutual-
 # exclusion validators, unrelated to this script's own job-queue axes).
+#
+# CHECKPOINT_FILE specifically is now ALSO rejected by bench (SystemExit at argv-parse
+# time, 2026-09-10 checkpoint content-hash structural fix) whenever a job covers more
+# than one fixed_sl -- which every job queued by this script's own $FIXED_SL_CSV does by
+# default (a single job's --fixed-sl-values is the WHOLE $FIXED_SL_VALUES list, e.g. all
+# of "1 2 3 4 5 6 7 8", not one value per job). A single shared CHECKPOINT_FILE path can't
+# hold more than one fixed_sl's real identity hash. Prefer USE_CHECKPOINT=1 for any queue
+# run -- its auto-computed path is naturally distinct per fixed_sl and has no such gap.
 USE_CHECKPOINT="${USE_CHECKPOINT:-}"
 CHECKPOINT_FILE="${CHECKPOINT_FILE:-}"
 # ATTACH_CAMPAIGN_ID (2026-09-02, real gap found live): resolve_campaign() below always
