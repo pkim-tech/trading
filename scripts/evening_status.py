@@ -1699,6 +1699,13 @@ def part3():
     for d in devs:
         print(f"  {d['scenario_key']:28s} {d['ticker'] or '':6s} {d['actual_summary']}")
 
+    explained_devs = [d for d in db.get_deviations(check_date=TODAY) if d.get('reason') is not None]
+    if explained_devs:
+        print(f"\n{len(explained_devs)} explained coverage_deviation(s) today (audit trail, not actionable)")
+        for d in explained_devs:
+            print(f"  {d['scenario_key']:28s} {d['ticker'] or '':6s} reason: {d['reason']} "
+                  f"(by {d['reason_by']} @ {d['reason_ts']})")
+
 
 def _token_reauth_status():
     """Schwab's refresh token is a hard 7-day cap from the last INTERACTIVE browser login --
