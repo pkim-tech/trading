@@ -439,6 +439,86 @@ def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, des
     return rows
 
 
+def _dispatch_grouped_by_wz(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh,
+                             desc="dispatch", fill_resolution="second"):
+    """fill_resolution='second' wrapper around `_dispatch` that sub-groups `tasks` by
+    (window, z_score_threshold) -- task[3]/task[4], see `cliffbox_tasks_for_cell`'s own
+    tuple-shape docstring -- and dispatches ONE (window, z) group fully (submitted to
+    `pool`, drained via `_dispatch`'s own as_completed/throttled-submission logic) before
+    moving to the next, instead of a single flat call over the tasks' union.
+
+    Why this matters specifically for fill_resolution='second' (2026-09-11, real
+    production gap -- this exact fix already existed in scripts/verify_v651_
+    cliffsafety_1s_timing.py, commits dc8f78e/a4e1408, 2026-09-07, but was never ported
+    into the real Phase2.5-cliffbox call sites below, which is what every actual
+    production campaign run uses): `_load_node_inputs_ground_truth`'s second-resolution
+    `_NODE_INPUT_CACHE_GT` entries are capped at 2/process (run_optimization_sweep.py,
+    deliberately tighter than the minute-resolution cap -- a real memory-safety fix, NOT
+    to be loosened here). A flat dispatch over a task set spanning many distinct
+    (window, z) pairs (a real production Phase2.5 seed set easily spans 4 windows x 4 z
+    = 16 pairs) interleaves cells across all of them in whatever order the pool's shared
+    call queue happens to hand them to workers -- once a worker's 2-entry cache holds 2
+    DIFFERENT (window, z) mpreps, every subsequent cell for a THIRD (window, z) evicts
+    both and forces a full ~0.9GB mprep rebuild (indicator + second-bucketing arrays)
+    from scratch, repeated over and over as the interleaving continues. This is
+    PER-PROCESS, so more workers means more independent tiny caches thrashing
+    independently, not less -- verify_v651's own real measurement: throughput collapsed
+    from 65-180 cells/sec (grouped) to 1.35 cells/sec (interleaved) on one real 11-(w,z)
+    GDXU group, a 50-130x difference, and the resulting sustained I/O correlated with a
+    real low-memory kill. Grouping so every cell for one (window, z) pair dispatches
+    before the next pair starts means each worker's cache, once warmed for that pair,
+    stays warm for the whole group instead of being evicted every few cells.
+
+    Dispatch ORDER changes only efficiency, never any computed VALUE -- `_dispatch`'s own
+    per-cell kernel call takes a fully self-contained args tuple and is unaffected by
+    which other cells ran before it; the only cross-task state is the worker-side loader
+    caches (`_NODE_INPUT_CACHE_GT`/`_SECOND_DF_CACHE`), which are pure memoization
+    (performance only, verified read-only downstream, see run_optimization_sweep.py's
+    own preload-fix docstring). Confirmed two ways, not assumed: a pure grouping/
+    reassembly unit test (no pool/DB) proves this function's own task-partitioning is
+    exact -- every input task lands in exactly one group and every group's rows are
+    concatenated back, nothing dropped/duplicated -- and independent-cold + contextual
+    Opus review (2026-09-11) both traced `_record`'s row construction and confirmed it
+    depends only on the task's own params, never on what else was dispatched
+    alongside/before it. Sorts groups by (window, z) purely for deterministic/readable
+    logging, matching
+    verify_v651's own convention -- correctness doesn't depend on group order, only on
+    each group being fully drained before the next one starts.
+
+    Per-group dispatch (rather than one flat call) does NOT weaken `_dispatch`'s own
+    2026-09-11 aggregate "HIGH FAILURE RATE" tag: that tag fires per-call when a call's
+    own failure fraction reaches 25%. The whole-stage aggregate fraction this replaces
+    is a weighted mean of the per-group fractions (weighted by group size) -- if the
+    aggregate were >= 25%, at least one group's own fraction must ALSO be >= 25%
+    (a weighted mean of values all below a threshold cannot itself reach that
+    threshold), so the tag still fires whenever it would have, just attached to the
+    specific (window, z) group actually responsible instead of the whole stage --
+    strictly more diagnosable, not less.
+
+    Real throughput validation (2026-09-11, --workers 8, AGQ/TrailingBoth fixed_sl=4,
+    full real grid window=[5,10,15,20] z=[0.5,1.0,1.5,2.0] -- 16 distinct (window,z)
+    pairs, same grid width as a real production campaign -- run under a scratch
+    campaign-label so it didn't touch/collide with the live v6.5.2 campaign job running
+    concurrently at the time): Phase2.5-cliffbox (7,563 real cells, including window/z
+    and arm_pct backfill) completed in 50.2s -- 151 cells/sec. The live campaign job's
+    own real, unfixed fixed_sl=2 cliffbox stage that same night measured 6,234 cells in
+    3,215.6s -- 1.94 cells/sec. ~78x throughput improvement, consistent with
+    verify_v651_cliffsafety_1s_timing.py's own documented 50-130x range for this same
+    fix. rc=0, no errors, system memory stayed safe (9.8-11Gi used / 11-13Gi available)
+    throughout, run concurrently alongside the live job's own resident processes."""
+    tasks_by_wz = {}
+    for t in tasks:
+        key = (t[3], t[4])
+        tasks_by_wz.setdefault(key, set()).add(t)
+
+    rows = []
+    for (w, z), wz_tasks in sorted(tasks_by_wz.items()):
+        wz_rows = _dispatch(pool, wz_tasks, ticker, strategy_name, version, fixed_sl, spy_bh,
+                             desc=f"{desc} w={w} z={z}", fill_resolution=fill_resolution)
+        rows.extend(wz_rows)
+    return rows
+
+
 def _insert_phase1_insurance_rows(rows, strategy_name, config_version, ticker, fixed_sl, entry_timing):
     """Dedicated insurance-snapshot table, separate from backtest_cache on purpose
     (2026-08-27, per design discussion) -- this data is a write-once debug aid for
@@ -2850,8 +2930,9 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
           f"were already computed in Phase1/Phase2 -- redundant recompute.")
 
     t4 = time.time()
-    phase25_rows = _dispatch(pool, phase25_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
-                              desc="Phase2.5-cliffbox (in-memory)", fill_resolution="second")
+    phase25_rows = _dispatch_grouped_by_wz(pool, phase25_tasks, TICKER, strategy_name, version,
+                                            fixed_sl, spy_bh, desc="Phase2.5-cliffbox (in-memory)",
+                                            fill_resolution="second")
     t5 = time.time()
     print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2.5 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
           f"{len(phase25_rows):,} rows in {t5 - t4:.1f}s "
@@ -3104,9 +3185,10 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                   f"final candidates' own +-{CLIFF_RADIUS} neighborhoods were never computed at "
                   f"1s resolution during Phase2.5 -- dispatching now so worst_neighbor_cagr never "
                   f"mixes resolutions.")
-            completion_rows = _dispatch(pool, missing_for_final, TICKER, strategy_name, version,
-                                         fixed_sl, spy_bh, desc="Phase2.5-cliffbox-completion "
-                                         "(in-memory)", fill_resolution="second")
+            completion_rows = _dispatch_grouped_by_wz(pool, missing_for_final, TICKER, strategy_name,
+                                                       version, fixed_sl, spy_bh,
+                                                       desc="Phase2.5-cliffbox-completion (in-memory)",
+                                                       fill_resolution="second")
             # No manual "resolution" stamp here (2026-09-06, round 2 fix) -- completion_rows
             # already carries each cell's REAL resolution via _record (see _second_build_
             # active's own comment above), including the per-cell-fallback case this

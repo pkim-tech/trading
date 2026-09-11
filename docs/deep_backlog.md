@@ -1,5 +1,132 @@
 # Backlog
 
+## ✅ [backtest][tooling] Resolved 2026-09-11 — Phase2.5-cliffbox dispatch grouped by (window, z) to stop redundant second-resolution mprep recompute (distinct bug from the same-day memory-duplication fix above)
+
+Diagnosed by a peer research session, a distinct bug from the earlier same-day
+preload-before-fork memory-duplication fix (see the entry below this one) -- that fix
+was about N COPIES of the raw ticker dataframe; this one is about REDUNDANT RECOMPUTE
+of the derived per-(window,z) indicator arrays.
+
+**Root cause**: `run_optimization_sweep.py`'s `_load_node_inputs_ground_truth` caches
+its derived "mprep" (indicator + second-bucketing arrays, ~0.9GB each) in a per-process
+dict `_NODE_INPUT_CACHE_GT`, deliberately capped at only 2 entries for
+`fill_resolution='second'` work (a real, intentional memory-safety measure from the
+2026-09-06 incident, not to be loosened). `bench_phase1_phase2_inmemory.py`'s real
+Phase2.5-cliffbox dispatch builds a flat `set` of cliffbox task tuples (via
+`cliffbox_tasks_for_cell`) spanning every seed candidate's own `(window, z)` --
+a real production run easily spans 4 windows x 4 z-thresholds = 16 distinct pairs --
+and dispatches the WHOLE flat set in one `_dispatch()` call. Since a flat dispatch
+interleaves cells across all 16 pairs in whatever order the pool's shared worker queue
+hands them out, a worker holding cells for a 3rd distinct `(window, z)` pair evicts one
+of its 2 cached mpreps and must rebuild it from scratch -- repeated constantly as
+interleaving continues, real expensive CPU work, not a hypothetical. Confirmed live the
+same night: the real v6.5.2 campaign job's own unfixed fixed_sl=2 cliffbox stage
+measured 6,234 cells in 3,215.6s (~1.94 cells/sec).
+
+This EXACT problem was already solved once, just never ported to the real production
+path: `scripts/verify_v651_cliffsafety_1s_timing.py` (2026-09-07, commits
+dc8f78e/a4e1408) groups candidates by `(window, z)` before dispatching cliffbox tasks,
+and its own comment documents the real measured impact of NOT doing this: throughput
+collapsed from 65-180 cells/sec (grouped) to 1.35 cells/sec (interleaved) on one real
+11-`(window,z)` GDXU group, and the resulting sustained I/O correlated with a real
+low-memory kill. That script's own docstring is explicit that it's "a calling-script
+fix, not a kernel-wiring fix" -- the real production Phase2.5-cliffbox dispatch in
+`bench_phase1_phase2_inmemory.py` (what every actual live sweep campaign uses) never
+got this fix.
+
+**Fix**: ported the identical grouping pattern into a new reusable function
+`_dispatch_grouped_by_wz` (inserted right after `_dispatch`'s own definition, per the
+dispatch's own suggestion to extract a shared helper "so this doesn't drift out of sync
+a third time") -- groups a flat task set by `(task[3], task[4])` = `(window, z)`,
+dispatches ONE group fully (via the existing, unchanged `_dispatch`) before moving to
+the next (sorted for deterministic logging), and concatenates results. Both real call
+sites migrated: the main Phase2.5-cliffbox dispatch and the final-candidate completion
+pass. Confirmed via `grep` that these are the only two `_dispatch` calls in the file
+passing `fill_resolution="second"` -- the other two (Phase1-coarse, Phase2-island) use
+the default `"minute"` and correctly stay on plain `_dispatch`.
+
+**Output-invariance**: confirmed two ways. A pure grouping/reassembly unit test (no
+pool/DB) proves the function's task-partitioning is exact -- every input task lands in
+exactly one group, every group's rows are concatenated back, nothing dropped or
+duplicated. Both paired reviewers independently traced `_dispatch`'s per-cell
+`_record`/row-construction and confirmed it depends only on the task's own
+self-contained args tuple, never on what else was dispatched alongside/before it -- the
+only cross-task state is the worker-side loader caches, which are pure memoization
+(performance only). The contextual reviewer additionally confirmed a load-bearing
+detail that makes the fix actually work: `_get_second_resolution_pool` returns a
+persistent, module-level pool, so splitting one flat `_dispatch` into N per-group calls
+does NOT tear down/rebuild worker processes between groups -- the workers (and their
+warmed `_NODE_INPUT_CACHE_GT` entries) survive across group boundaries.
+
+**Real throughput validation** (2026-09-11, --workers 8, AGQ/TrailingBoth fixed_sl=4,
+full real grid window=[5,10,15,20] z=[0.5,1.0,1.5,2.0] -- 16 distinct pairs, same grid
+width as a real production campaign, run under a scratch campaign-label so it didn't
+touch/collide with the live v6.5.2 campaign job running concurrently): Phase2.5-cliffbox
+(7,563 real cells including window/z and arm_pct backfill) completed in 50.2s -- 151
+cells/sec, vs. the live job's own real 1.94 cells/sec baseline that same night -- ~78x
+improvement, consistent with verify_v651's own documented 50-130x range. rc=0, no
+errors, system memory stayed safe (9.8-11Gi used / 11-13Gi available) throughout,
+run concurrently alongside the live job's own resident processes.
+
+**Paired review** (independent-cold + contextual Opus): no HIGH or MEDIUM findings from
+either. Both independently confirmed the task-tuple index convention (`t[3]`=window,
+`t[4]`=z_score_threshold), complete migration of both real `fill_resolution='second'`
+call sites, and that the recently-added (same-day, different session) "HIGH FAILURE
+RATE" aggregate-visibility tag in `_dispatch` cannot be silently weakened by per-group
+evaluation -- the whole-stage aggregate failure fraction is a size-weighted mean of the
+per-group fractions, so if the true aggregate reaches 25%, at least one group's own
+fraction must also reach 25% (a weighted mean of values all below a threshold cannot
+itself reach that threshold) -- the tag still fires whenever it would have, just
+attached to the specific `(window,z)` group responsible instead of the whole stage.
+LOW findings only (not actioned, per the project's "only HIGH/CRITICAL findings"
+convention): a residual instance of the same thrash pattern in the final-9
+winner-trades loop (iterates `final_candidates` in ranking order, not `(window,z)`
+order -- bounded at ~9 iterations, nowhere near production-path severity); the
+completion-pass call site can trip the "HIGH FAILURE RATE" tag on a small group where 1
+failure = 25%; and `verify_v651_cliffsafety_1s_timing.py` still carries its own
+equivalent inline copy of the grouping logic rather than calling the new shared
+function (confirmed the two are behaviorally equivalent, so no near-term drift risk).
+
+## ✅ [backtest][tooling] Resolved 2026-09-11 — live fail_counts visibility added to Phase2.5's dispatch progress bar (`510883c`)
+Real gap found while diagnosing tonight's AGQ cliffbox errors: `fail_counts` was tracked incrementally but only ever printed once, after a whole stage finished — no live signal of a stage silently failing en masse while it ran.
+
+**Paired review (independent-cold + contextual, rebuttal-converged) found the fix as first proposed wouldn't have caught the real incident**: `mininterval=15.0` + `refresh=False` on the tqdm postfix meant it never rendered before a fast-failing stage finished — the real AGQ fixed_sl=3 stage ran 6,920 cells with 1,771 ERRORs in 10.0s flat (erroring cells short-circuit ~250x faster than real ones), so exactly 2 renders happened total (0% and close()'s 100%), zero intermediate visibility. The fix's usefulness was inversely correlated with the severity of what it was meant to catch. Fixed by forcing a render on each distinct status key's first occurrence (surfaces the first failure within milliseconds, bounded to ~6 forced redraws/stage). Also added a proportional/loud failure-rate line at stage end — the contextual reviewer found the real incident's `fail_counts` WAS already printed correctly that night and still got missed, since a 75%-failure stage read no differently on the page than a handful of expected misses.
+
+Also caught on review: the first-draft comment conflated the real incident (`status='ERROR'`) with a different, unrelated code path (silent SUCCESS-with-minute-fallback) that never actually fired that night — wording corrected so it doesn't mislead a future reader.
+
+Both fixes verified empirically post-fix. 1 file, 49 insertions/2 deletions.
+
+## [backtest][tooling] Open, raised 2026-09-11 — no display/grouping design for the new 5-curve overlay-risk-check columns (now committed, `6f1741f`)
+20 real `phase4_results` columns now exist: 5 equity curves (addon-only, core+addon_ungated, drought-only, core+drought_ungated, core+addon+drought_ungated) × 4 fields each (drawdown_pct/worst_fold_cagr_pct/any_fold_fragile/n_folds_populated). No report (`candidate_full_review.py`'s xlsx, the Trade-Flow Accountability Grid, etc.) has any design for presenting these — which combos matter for which promotion decision, how to group/label so a reader doesn't hold 20 columns in their head, whether a node with only drought enabled (no addon) needs the addon-only/core+addon columns surfaced at all, and how `n_folds_populated` (the sparse-fold caveat) should be visually distinguished from a genuinely-computed value. Not scoped, not started — real data now exists to design against (query `phase4_results` for any GDXU/KORU scope already checked).
+
+## [backtest] Open, raised 2026-09-11 — 6 v6.5.2 tickers that finished before the overlay-risk-check landed are missing the new columns
+SOXL, DPST, NUGT, KORU, LABU, ETHU-Both all completed their Phase1/2/2.5 sweep before `6f1741f` landed — their `candidate_nodes` rows are still fully valid (core sweep math unchanged), but their `phase4_results` rows lack the new 20 columns. Fix is NOT a resweep — `run_candidate_nodes_campaign_verification.py` scopes Phase4 to `(ticker, version, window)` against already-existing `candidate_nodes` rows directly (confirmed via its own docstring/`gt_rows_for_scope` usage), so a standalone Phase4-only re-run backfills these cheaply. Not started — do once convenient, no urgency.
+
+## [live-trading][backtest][coverage] Open, raised 2026-09-11 — no reconciliation between real broker-executed drought/add-on legs and the kernel
+`scripts/verify_real_trades_vs_kernel.py` (the real "trades must equal backtest" North Star instrument) is explicit in its own docstring that it only covers `trade_log` rows with `position_source='core'` — real drought/add-on legs are excluded ("no kernel-replay path yet"). So while core trades have a standing, working reconciliation tool, nothing currently replays a real broker-executed drought or add-on fill against `backtester.simulate_drought_overlay_ground_truth`/`apply_addon_overlay_ground_truth` to confirm live's overlay execution matches what the kernel says should have happened. Surfaced while doing a v6.5.2 post-sweep core/overlay validation pass (this session's Stage 6 work, see `docs/research_log.md`'s 2026-09-11 entry and `backtest-change-rollout`'s new Stage 6) — that work confirms the *backtest* overlay math is correct, but says nothing about whether real live drought/add-on fills have ever diverged from it the way core trades occasionally have (e.g. RETL's same-bar re-entry). Not scoped, not started — real design question of what a drought/add-on leg's kernel counterpart even means positionally (a drought leg has no `pending_buys`/`open_positions` row shaped like a core trade today) before a replay tool can be built.
+
+## [tooling][docs] Open, raised 2026-09-11 — no "critical scripts" inventory distinct from `scripts/list_scripts.py`'s full mechanical index
+`list_scripts.py` is deliberately just every `scripts/*.py`'s docstring first-sentence, unfiltered/unranked (78+ scripts and growing) — good for "what does X do" lookup, bad for "what are the standing verification tools I should actually know about." This session leaned on several of the latter (`sim_1s_vs_1m_groundtruth.py`/`sim_1s_vs_1m_groundtruth_overlays.py` for post-sweep spot-checks — now also pointed to from `backtest-change-rollout`'s Stage 6 — plus `verify_real_trades_vs_kernel.py`, `trace_real_vs_kernel_divergence.py`) that aren't otherwise surfaced anywhere as "the" tool for their job; found by reading docstrings/git history in-session, not by any inventory. Proposed: a short curated "critical scripts" list (name + one-line "use this for X", distinct from the full mechanical index) — candidates so far: the ground-truth/kernel-verification cluster above, `scripts/coverage_registry.py`, `scripts/daemon_status.py`. Not scoped, not started.
+
+## [backtest][research] Open, parked 2026-09-11 — test sub-1% `trail_buy_pct` (e.g. 0.1%) for TrailingBoth, requires a real grid-resolution change + resweep, not a one-off param swap
+Hypothesis: TrailingBoth's wait-for-bounce is really a momentum-confirmation filter (only enter if price shows a near-term bounce after the dip) — valuable on tickers whose dips reliably bounce-then-revert, a net cost (missed/delayed entries) on tickers that don't. TrailingExit's unconditional immediate entry can beat TrailingBoth on the latter kind (plausible fit: KORU, which also shows a much larger 1m-vs-1s CAGR delta than SOXL, consistent with noisier intrabar action generally — see 2026-09-11 research_log entry). A tiny trail (~0.1%) might get most of the momentum filter's benefit while avoiding most of its miss-rate cost. **Why not a quick manual test**: `window`/`z`/`fixed_sl`/`arm_pct`/`trail_sell_pct`/`max_hold_hours` are all jointly optimized around whatever `trail_buy_pct` Phase2's island mesh landed on — swapping just that one axis to 0.1% on an otherwise-fixed config tests "does 0.1% help this config tuned for a much bigger trail," not the real hypothesis, and would likely show a false negative. Real test needs `0.1` (or a few sub-1% values) actually in the swept grid so Phase2 re-optimizes everything else around it — `run_optimization_sweep.py:4566-4567`'s `for tp/sl in range(1, 31)` sweeps whole percentages only, no sub-1% branch exists. Proposed: add a sub-1% grid option (this axis only) and resweep a candidate ticker like KORU (`backtest-change-rollout`-style staged test), see if the joint optimum shifts. Not scoped, not started.
+
+## ✅ [backtest][live-trading][HIGH] Resolved 2026-09-11 — overlay-inclusive Check11/Check13 risk checks added (5 equity curves), closes "every safety check is core-only" gap found 2026-09-08
+Root cause (found 2026-09-08, live-vs-picks promotion review): `_check11_max_drawdown_gt`/`_check13_walk_forward_gt` only ever ran against the plain core `trades` list — `core_safe`/`addon_safe`/`check11_max_drawdown_pct`/`check13_worst_fold_cagr_pct` described core-only risk, so a promoted addon/drought node had zero drawdown/fold-fragility verification on the overlay portion of its equity curve, even though the overlay-blended trade lists (`addon_trades` via `apply_addon_overlay_ground_truth`, drought windows via `simulate_drought_overlay_ground_truth`) already existed elsewhere in the same function for computing return-only CAGR numbers.
+
+**Built** (commit `6f1741f`, 5 files, 277 insertions/9 deletions): Check11/Check13 now run against 5 equity curves — addon-only isolated (dated via `Arm Time`→`Exit Time`), core+addon combined, drought-only isolated, core+drought combined, core+addon+drought (triple-stack) — via a new `backtester.py` addition (per-window `best_window_times` on `simulate_drought_overlay_ground_truth`'s winning cell, needed since drought windows previously had no timestamps to build a dated equity curve from) and a new `run_optimization_sweep.py` `_overlay_risk_checks_gt` function wired into the per-candidate Phase4 loop. Persisted as 20 new `phase4_results` columns (not the originally-planned 15 — see round-2 finding below) through `candidate_verification_store.py`, `run_candidate_nodes_campaign_verification.py`, `candidate_summary_report.py`.
+
+**Paired review (independent-cold + contextual Opus, rebuttal-confirmed) caught 3 real HIGH findings, all fixed before commit:**
+1. Check13 was annualizing each curve against its OWN sparse date extent instead of the real backtest span — inflated CAGR on clustered overlay activity, false negatives on `any_fold_fragile`. Fixed via an optional `date_range` param, all 5 combos now fold against the core trades' own (Entry Time min, Exit Time max) span.
+2. Empty Check13 folds (n=0) silently voted "not fragile" and were skipped from `worst_fold_cagr_pct`'s `min()` — indistinguishable from a genuinely healthy fold. Real-data check: 29.4% of drought-bearing candidates have <10 windows, the common case for drought-only, not an edge case. Fixed by persisting a 4th field per combo, `{prefix}_n_folds_populated`, so "too sparse to evaluate" is distinguishable from "genuinely robust" after the fact.
+3. `core_addon`/`core_both` fed the blended (unfloored) addon `Return` straight into the drawdown/fold checks with no `return_below_floor` guard — confirmed empirically unbounded and sign-inverted (10 trades after one floor breach produced a -2983% "drawdown"). Fixed by mirroring the real existing precedent (`run_optimization_sweep.py:3210-3227`'s add-on CAGR path, which already `None`s out on any floor breach rather than aggregating) — excludes the triple on breach, does not flag-and-aggregate. (A mid-session peer relay suggested reversing this to observe-not-exclude, based on a different, less-authoritative consumer; verified against the real precedent and declined — both reviewers independently confirmed exclude-on-breach is correct on rebuttal.)
+
+Also renamed `core_addon`/`core_drought`/`core_both` → `core_addon_ungated`/`core_drought_ungated`/`core_both_ungated` on review (naming-collision fix vs. this same table's existing gated `core_both_cagr_pct` — 0 rows were populated yet, free to rename).
+
+**Verified**: GDXU sanity run across all 25 candidates in scope post-fix — sane, differentiated values, no crashes, sparse-fold case correctly shows `n_folds_populated<5` with `any_fold_fragile` properly flagged rather than silently reading healthy. DB persistence round-trip tested against a scratch sqlite file. Pre-commit checklist run clean (`verify_trailing_buy/sell_resolution.py`, `signals_invariants.py`).
+
+**Follow-up, not yet started**: no report (`candidate_full_review.py`'s xlsx, the Trade-Flow Accountability Grid) has a display/grouping design for the new columns yet (see `docs/backlog_cache.md`'s 2026-09-11 tooling entry, still open) — and the 6 v6.5.2 tickers that already finished their Phase1/2/2.5 sweep before this landed (SOXL, DPST, NUGT, KORU, LABU, ETHU-Both) are missing these columns in their `phase4_results` rows; a standalone Phase4-only re-run (`run_candidate_nodes_campaign_verification.py`, no resweep needed) can backfill them once convenient.
+
 ## ✅ [backtest][tooling] Resolved 2026-09-11 — second-resolution/main-pool worker memory duplication in `bench_phase1_phase2_inmemory.py` root-caused+fixed (preload-before-fork)
 
 Diagnosed by a peer research session: `SECOND_RESOLUTION_MAX_CONCURRENT` was capped at

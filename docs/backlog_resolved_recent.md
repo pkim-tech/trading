@@ -1,5 +1,11 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-09-11 — Phase2.5-cliffbox dispatch grouped by (window,z) to stop per-process second-resolution mprep cache thrashing: ~78x throughput (151 cells/sec vs. live job's own 1.94 cells/sec baseline), ported from verify_v651_cliffsafety_1s_timing.py's existing fix (never applied to the real production path before). Paired review: no HIGH/MEDIUM findings. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-09-11 — live fail_counts visibility added to Phase2.5 dispatch progress bar (`510883c`); paired review found the first-draft fix wouldn't have caught a fast-failing stage (mininterval too coarse), fixed to render on each status's first occurrence + a loud proportional failure-rate line. Full detail: `deep_backlog.md`.
+
+## [backtest][live-trading][HIGH] Resolved 2026-09-11 — overlay-inclusive Check11/Check13 risk checks added (5 equity curves: addon-only, core+addon, drought-only, core+drought, core+addon+drought); paired review found+fixed 3 HIGH (fold-span annualization, silent empty-fold voting, missing return_below_floor exclusion). 20 new phase4_results columns. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-11 — second-resolution/main-pool worker memory duplication fixed (preload-before-fork, matching phase5_second_level_overlay_check.py's own pattern): second-res workers ~2.85GB→~670MB RSS each, confirmed output-invariant (bit-identical trades/CAGR pre/post), re-validated at --workers 4 and 8 under real combined load with a live campaign job; SECOND_RESOLUTION_MAX_CONCURRENT independent cap removed (now matches --workers). Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling][HIGH] Resolved 2026-09-10 — checkpoint identity replaced with content hash + manifest, sweep_run_log provenance added (`05f63b0`); paired review found+fixed 1 HIGH (`--checkpoint-file` + multi-fixed_sl collision) + 3 MEDIUM + 2 LOW. Full detail: `deep_backlog.md`.
