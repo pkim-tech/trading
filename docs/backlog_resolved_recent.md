@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling][HIGH] Resolved 2026-09-10 — checkpoint identity replaced with content hash + manifest, sweep_run_log provenance added (`05f63b0`); paired review found+fixed 1 HIGH (`--checkpoint-file` + multi-fixed_sl collision) + 3 MEDIUM + 2 LOW. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved-as-not-needed 2026-09-08 — island-pooling crowd-out fix + live-node force-seeding both dropped: sweep's actual picks already beat/match live on every ticker checked (HIBL/GDXU/KORU/NUGT/OILU). "Get better, not protect the incumbent." Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved 2026-09-06 — Phase2.5/Phase4 1s-fill-resolution kernel wiring committed: reverified on corrected data, 4 held findings + 2 round-2 paired-review findings (selection-bias, insufficient memory mitigation) fixed, real memory near-miss caught+fixed under a full end-to-end run. Full detail: `deep_backlog.md`.
