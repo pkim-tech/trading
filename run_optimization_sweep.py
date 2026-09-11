@@ -1051,6 +1051,44 @@ def _load_second_df(ticker, data_source="massive"):
     return df
 
 
+_HOURLY_DF_CACHE_GT = {}
+_HOURLY_DF_CACHE_GT_MAX = 3  # hourly frames are ~2 orders of magnitude smaller than
+                             # minute/second ones -- this cap buys near-zero memory
+                             # savings, its real payoff is CPU (skipping a re-parse per
+                             # distinct (w, z) key in one worker process). 3 just matches
+                             # _MINUTE_DF_CACHE_MAX's cap value, not its memory rationale.
+
+
+def _load_hourly_df_ground_truth(ticker, data_source="yahoo"):
+    """Raw hourly loader for _load_node_inputs_ground_truth, split out (2026-09-11) so it
+    memoizes the same way _load_minute_df/_load_second_df already do -- a module-level
+    dict keyed on (ticker, data_source), checked before any I/O. Previously this was
+    called inline on every _NODE_INPUT_CACHE_GT miss with no memoization of its own,
+    meaning a worker process processing multiple distinct (window, z) keys for the same
+    ticker re-loaded/re-parsed the identical hourly frame once per key. Also gives a
+    caller (bench_phase1_phase2_inmemory.py's main(), fixed to one ticker for its whole
+    process lifetime) a preload hook to call once in the main process before its
+    ProcessPoolExecutor forks -- same COW-sharing rationale as _load_second_df's own
+    preload (see bench_phase1_phase2_inmemory.py's SECOND_RESOLUTION_MAX_CONCURRENT
+    docstring)."""
+    key = (ticker, data_source)
+    hit = _HOURLY_DF_CACHE_GT.get(key)
+    if hit is not None:
+        return hit
+    if data_source == "massive":
+        import db_cache
+        df = db_cache.get_massive_hourly_ohlcv(ticker)
+    else:
+        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+        df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df = df.sort_index()
+    if len(_HOURLY_DF_CACHE_GT) >= _HOURLY_DF_CACHE_GT_MAX:
+        _HOURLY_DF_CACHE_GT.clear()
+    _HOURLY_DF_CACHE_GT[key] = df
+    return df
+
+
 def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
                                     start_date=None, end_date=None, data_source="yahoo",
                                     fill_resolution="minute"):
@@ -1102,14 +1140,7 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
     if hit is not None:
         return hit
 
-    if data_source == "massive":
-        import db_cache
-        df_hourly_raw = db_cache.get_massive_hourly_ohlcv(ticker)
-    else:
-        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
-        df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-        df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
-        df_hourly_raw = df_hourly_raw.sort_index()
+    df_hourly_raw = _load_hourly_df_ground_truth(ticker, data_source=data_source)
     if df_hourly_raw.empty:
         entry = None
     else:

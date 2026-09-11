@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-09-11 — second-resolution/main-pool worker memory duplication fixed (preload-before-fork, matching phase5_second_level_overlay_check.py's own pattern): second-res workers ~2.85GB→~670MB RSS each, confirmed output-invariant (bit-identical trades/CAGR pre/post), re-validated at --workers 4 and 8 under real combined load with a live campaign job; SECOND_RESOLUTION_MAX_CONCURRENT independent cap removed (now matches --workers). Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling][HIGH] Resolved 2026-09-10 — checkpoint identity replaced with content hash + manifest, sweep_run_log provenance added (`05f63b0`); paired review found+fixed 1 HIGH (`--checkpoint-file` + multi-fixed_sl collision) + 3 MEDIUM + 2 LOW. Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved-as-not-needed 2026-09-08 — island-pooling crowd-out fix + live-node force-seeding both dropped: sweep's actual picks already beat/match live on every ticker checked (HIBL/GDXU/KORU/NUGT/OILU). "Get better, not protect the incumbent." Full detail: `deep_backlog.md`.

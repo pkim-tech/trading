@@ -1,5 +1,96 @@
 # Backlog
 
+## ✅ [backtest][tooling] Resolved 2026-09-11 — second-resolution/main-pool worker memory duplication in `bench_phase1_phase2_inmemory.py` root-caused+fixed (preload-before-fork)
+
+Diagnosed by a peer research session: `SECOND_RESOLUTION_MAX_CONCURRENT` was capped at
+2 (2026-09-06 incident, see the 2026-09-08 entry below) specifically because each
+second-resolution pool worker independently loaded and retained its own full private
+copy of a ticker's ~2.85GB second-resolution dataframe -- Linux `ProcessPoolExecutor`
+forks workers lazily, and copy-on-write sharing only covers memory that existed in the
+PARENT process before a given worker's fork; neither `run_optimization_sweep.py`'s
+`_load_second_df`/`_load_minute_df` module-dict caches, nor the raw hourly dataframe
+(previously loaded inline via an uncached `db_cache.get_massive_hourly_ohlcv(ticker)`
+call), were ever populated in the main process before either the main 8-worker pool or
+the second-resolution pool was created -- so every distinct worker that picked up a
+task for this ticker paid its own full load. Measured: ~2.85GB/worker for second-res
+workers (capping concurrency at 2), ~0.37GB/worker x 8 for the main pool (smaller but
+same root cause).
+
+**Fix**: extracted a new cached `_load_hourly_df_ground_truth` (run_optimization_sweep.py,
+matching `_load_minute_df`/`_load_second_df`'s existing `(ticker, data_source)`-keyed
+module-dict pattern) out of previously-uncached inline code in
+`_load_node_inputs_ground_truth`. `bench_phase1_phase2_inmemory.py`'s `main()` -- scoped
+to exactly one `TICKER` for its whole process lifetime -- now calls all three loaders
+once, in the main process, after `TICKER`/`DATA_SOURCE` are fully resolved but before
+EITHER `ProcessPoolExecutor` is created (the second-res pool is lazily created later,
+from inside worker dispatch, so it necessarily forks after the preload too). Every
+worker forked afterward inherits the already-loaded frames via copy-on-write, matching
+the identical pattern `scripts/phase5_second_level_overlay_check.py` already used for
+its own `_DFH`/`_DF_1M`/`_DF_1S` globals. Second-res preload wrapped in
+try/except ValueError, falling back exactly as `_load_node_inputs_ground_truth` already
+did for a ticker with no active `massive_second_derived` build.
+
+**Output-invariance confirmed twice**, not assumed: (1) `_load_node_inputs_ground_truth`
+called directly pre-fix (git stash) vs post-fix for AGQ/TrailingBoth/w=10/z=1.0 produced
+byte-identical hourly/minute dataframe shapes and index bounds; (2) the real kernel path
+(`run_single_backtest_node_ground_truth_isolated`, fill_resolution="second") run for a
+real node (AGQ/TrailingBoth tp=3/sl=4/hold=168/w=10/z=1.0/fixed_sl=4) pre-fix vs
+post-fix produced bit-identical output: 147 trades, CAGR 15.576425954261165%, every
+other payload field identical.
+
+**Real re-validation** (2026-09-11, --workers 4, AGQ, full Phase1+Phase2+Phase2.5+
+completion+winner-trades pipeline, under `campaign-label
+v6.5.2-smoketest-secondrespool-fix` so it doesn't pollute real v6.5.2 accounting) --
+run WHILE a live 8-worker v6.5.2 campaign job (its own second-res pool still on the OLD
+pre-fix code already resident in that process) was also running, a harder combined-load
+test than normal solo operation: this run's second-res workers peaked at ~670-707MB RSS
+each (vs. the ~2.85GB/worker baseline independently reconfirmed from the OTHER,
+still-unfixed job's second-res workers in the same `ps` samples) -- ~75% per-worker
+reduction. System-wide used memory peaked at ~12Gi/23Gi across the whole combined run
+(box RAM was separately upgraded 15Gi->23Gi since the 2026-09-06 incident), never below
+~10Gi available. rc=0, no low-memory intervention. `SECOND_RESOLUTION_MAX_CONCURRENT`
+raised 2->4 (a conservative half-step, not maxed to what raw arithmetic could justify --
+at ~700MB/worker, 4 workers costs less total (~2.8GB) than the OLD 2-worker cost
+(~5.7GB) did pre-fix).
+
+**Same-day follow-up (user request, relayed mid-review)**: removed the independent cap
+entirely -- `SECOND_RESOLUTION_MAX_CONCURRENT` now defaults to `None`, so the
+second-res pool always matches whatever size the main pool already is (from
+`--workers`), one concurrency knob instead of two; an explicit int override is still
+supported for a future manual cap. Re-validated at `--workers 8` (same full end-to-end
+method, run concurrently with the SAME live v6.5.2 campaign job as the `--workers 4`
+test above): 8 second-res workers peaked at ~669.6-669.7MB RSS EACH -- i.e. 8 workers
+(~5.4GB total) cost about the SAME total second-res-pool memory as the OLD 2-worker cap
+did pre-fix (~5.7GB), because per-worker cost kept dropping as more workers shared the
+one COW-inherited copy. Main pool's own 8 workers peaked at ~471-473MB each. System-wide
+used memory peaked at 13Gi/23Gi across the hardest combined-load case tested (this run's
+8+8=16 workers stacked on the live job's own 8+2=10 -- 26 real OS processes touching
+this ticker's data at once), rc=0, no low-memory intervention. That measured used-memory
+peak (13Gi) is itself well below what naively summing every process's own RSS would
+suggest -- further confirmation the COW-sharing is real (RSS is charged per-process even
+for physically-shared read-only pages).
+
+**Paired review** (independent-cold + contextual Opus): both independently verified the
+fix's mechanics on all points (TICKER/DATA_SOURCE fully resolved before the preload,
+fork/COW semantics hold on this venv's Python 3.10.12, cache-key consistency, no
+in-place mutation of the now-shared hourly/minute/second dataframes anywhere
+downstream, no ordering/race risk with the second-res pool's lazy creation) and found
+no defect in the fix itself. Both independently flagged the same HIGH process finding:
+the working tree at review time co-mingled this fix with a concurrent peer session's
+unrelated, unfinished overlay-risk-check work in the same file
+(`run_optimization_sweep.py`) -- resolved by hunk-scoping the commit
+(`git add -p`) to only this fix's two hunks, leaving the other session's uncommitted
+work untouched for its own separate review/commit. Two LOW findings on THIS fix
+(actioned): the `_HOURLY_DF_CACHE_GT_MAX` cap comment overstated its memory rationale
+(hourly frames are ~2 orders of magnitude smaller than minute/second ones -- the real
+payoff there is CPU, not memory; comment corrected). Two more LOW findings (not
+actioned, logged here for visibility): the hourly preload's `ValueError` for a
+ticker with no promoted hourly build is currently unguarded (degrades a previously
+friendly `compute_bh_returns` `SystemExit` into an earlier bare traceback), and the
+preload is unconditional even on a fully-resumed run where every `fixed_sl` is already
+finished (wasted ~3GB/tens-of-seconds load with zero correctness impact) -- both real
+but genuinely low-priority per the project's "only HIGH/CRITICAL findings" convention.
+
 ## ✅ [live-trading] Resolved 2026-09-08 — real-fill sizing-sanity check added to signals_invariants.py, closes the gap that let trading_incident #17 (UGL ~2x oversized entry) go undetected
 
 Planner dispatch after `trading_incidents.py` incident #17 (real_money_impact=True):

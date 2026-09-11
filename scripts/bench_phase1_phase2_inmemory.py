@@ -42,7 +42,8 @@ from run_optimization_sweep import (
     compute_bh_returns, window_version_suffix, run_single_backtest_node_ground_truth_isolated,
     _trail_pcts_for_strategy, pick_island_centers, FINE_RADIUS, N_ISLANDS,
     CLIFF_RADIUS, PHASE25_ISLAND_CLIFFBOX_CAGR_MIN, GT_CANDIDATE_TIEBREAK,
-    DB_PATH, _load_node_inputs_ground_truth,
+    DB_PATH, _load_node_inputs_ground_truth, _load_minute_df, _load_second_df,
+    _load_hourly_df_ground_truth,
 )
 from run_ground_truth_neighborhood import load_live_node
 from backtester import run_backtest_ground_truth
@@ -157,15 +158,88 @@ CAMPAIGN_LABEL = "v6.5"
 # result of this negative finding, not a guess -- re-validate under the SAME full
 # end-to-end seed-mode invocation (not just an isolated _dispatch test) before trusting
 # any value here again.
-SECOND_RESOLUTION_MAX_CONCURRENT = 2
+#
+# Round-4 fix + re-validation (2026-09-11): root cause of the whole 2.3-2.85GB/worker
+# problem diagnosed -- this pool (and the main pool) forked its workers BEFORE any
+# ticker data was loaded anywhere, so each worker independently loaded (and kept) its
+# own full private copy of the second-resolution df on first use; Linux fork's
+# copy-on-write sharing only covers memory that existed in the PARENT before that
+# worker was forked, and none did. Real fix (see main()'s preload-before-fork block,
+# same pattern scripts/phase5_second_level_overlay_check.py already used for its own
+# _DFH/_DF_1M/_DF_1S globals): main() now calls _load_hourly_df_ground_truth/
+# _load_minute_df/_load_second_df for TICKER once, in the main process, before EITHER
+# pool is created -- every worker forked afterward inherits the already-loaded frames
+# via COW for free. Confirmed output-invariant first (pre-fix vs post-fix, same real
+# AGQ/TrailingBoth node run through the actual kernel path: 147 trades, CAGR
+# 15.576425954261165%, every payload field byte-identical).
+#
+# Also box RAM was upgraded 15Gi -> 23Gi since the 2026-09-06 incident above (+8GB,
+# user-confirmed) -- a second, independent reason real margin is now larger than the
+# numbers in Round-1/2/3 above assumed.
+#
+# Real re-validation (2026-09-11, under load harder than a normal solo run): ran the
+# full end-to-end pipeline (--workers 4, AGQ, single window/z, Phase1+Phase2+Phase2.5+
+# completion+winner-trades) WHILE a real live 8-worker v6.5.2 campaign job (its own
+# still-uncapped-at-the-time second-res pool at 2 workers, running the OLD pre-fix
+# code already resident in that process's memory) was also running -- a harsher
+# combined-load test than this fix will ever see in normal solo operation. Measured via
+# `ps`/`free` sampled every 15s for the whole run: this run's own second-res pool
+# workers peaked at ~670-707MB RSS each (vs. the historical ~2.85GB/worker baseline --
+# confirmed from the OTHER, still-unfixed job's second-res workers in the SAME sample
+# set, which measured ~2.9GB each, matching the original incident numbers almost
+# exactly) -- a ~75% per-worker reduction, consistent with COW-sharing actually working
+# (residual ~700MB/worker, not near-zero, is real per-process interpreter/pandas/prep-
+# cache overhead, not unshared ticker data). System-wide used memory peaked at ~12Gi/
+# 23Gi (never below ~10Gi available) across the ENTIRE combined run (this fix's full
+# pipeline run stacked on top of the live job's own 8+2=10 resident processes) -- real
+# margin, not a near-miss. rc=0, no low-memory intervention.
+#
+# Round-5 (2026-09-11, same day, user follow-up): with the preload-before-fork fix
+# above, a second-res worker's real marginal cost collapsed to roughly the MAIN pool's
+# own per-worker footprint (~0.37-0.7GB observed, not ~2.85GB) -- the entire reason this
+# pool needed an independent cap below --workers is gone. Removed the standalone cap:
+# SECOND_RESOLUTION_MAX_CONCURRENT now defaults to None, meaning this pool matches
+# whatever size the caller (the main pool, sized from --workers) already is -- the user
+# controls concurrency once, for both pools, the same way, instead of a second
+# independent knob nobody remembers exists. An explicit int override is still supported
+# (`min(SECOND_RESOLUTION_MAX_CONCURRENT, max_workers)`) in case a manual cap is ever
+# needed again -- e.g. for a box smaller than the one this was validated on. The
+# existing `workers_budget`/`campaign_registry.get_workers_budget` dynamic throttle in
+# `run_optimization_sweep._dispatch` (reads `dispatch_pool._max_workers` generically,
+# not this constant) already applies uniformly to whichever pool is active regardless
+# of this pool's OWN size at creation time -- unaffected by this change.
+#
+# Re-validated at the higher worker count this change actually enables (2026-09-11,
+# --workers 8, AGQ, same full end-to-end method as Round-4, run concurrently with the
+# SAME live 8-worker v6.5.2 campaign job (its own second-res pool still on the old
+# pre-fix code, cap 2, ~2.8-2.85GB/worker -- reconfirmed AGAIN in this run's own `ps`
+# samples) that Round-4 ran against): this run's 8 second-res workers peaked at
+# ~669.6-669.7MB RSS EACH -- i.e. going from 2 workers (Round-4) to 8 workers (this
+# round) cost about the SAME total second-res-pool memory (~5.4GB at 8x669MB vs.
+# ~5.7GB at the OLD 2x2.85GB cap) because per-worker cost kept dropping as more workers
+# shared the one COW-inherited copy. Main pool's own 8 workers peaked at
+# ~471-473MB each (small increase over Round-4's 4-worker ~491MB, expected -- more
+# workers means more distinct (window,z)-adjacent state resident at once, not a
+# regression). System-wide used memory peaked at 13Gi/23Gi across the whole combined
+# run (this run's own 8+8=16 workers stacked on the live job's own 8+2=10 -- 26 real OS
+# processes touching this ticker's data at once, the hardest combined-load case tested
+# so far) -- real RSS-sum-vs-actual-used gap here (naive sum of every process's own RSS
+# would suggest far more than 13Gi) is itself further confirmation the fix's COW-sharing
+# is real: RSS is charged per-process even for pages physically shared read-only across
+# sibling forks, so actual physical usage tracks well below the naive per-process sum.
+# rc=0, no low-memory intervention. Safe to leave SECOND_RESOLUTION_MAX_CONCURRENT
+# uncapped (None) at this box's current 23Gi -- re-validate again on a smaller box or a
+# meaningfully wider grid before trusting this at, say, --workers 16+.
+SECOND_RESOLUTION_MAX_CONCURRENT = None
 _SECOND_RES_POOL = None
 
 
 def _get_second_resolution_pool(max_workers):
     global _SECOND_RES_POOL
     if _SECOND_RES_POOL is None:
-        _SECOND_RES_POOL = ProcessPoolExecutor(
-            max_workers=min(SECOND_RESOLUTION_MAX_CONCURRENT, max_workers))
+        size = (max_workers if SECOND_RESOLUTION_MAX_CONCURRENT is None
+                 else min(SECOND_RESOLUTION_MAX_CONCURRENT, max_workers))
+        _SECOND_RES_POOL = ProcessPoolExecutor(max_workers=size)
     return _SECOND_RES_POOL
 
 
@@ -1782,6 +1856,38 @@ def main():
     # run_one_fixed_sl can bypass the full grid cross-product with it -- None in
     # every non-seed mode, leaving that function's existing behavior untouched.
     args._seed_task = seed["task"] if seed is not None else None
+
+    # Preload-before-fork (2026-09-11, real memory-scaling bug fix): this process is
+    # scoped to exactly one TICKER for its whole lifetime (finalized above by this
+    # point -- --ticker override, seed mode, or load_live_node all resolve before
+    # here). Both the main 8-worker pool (Phase1-coarse/Phase2-island, fill_resolution
+    # ='minute') and the separate second-resolution pool (Phase2.5-cliffbox,
+    # fill_resolution='second') call into run_optimization_sweep's worker-side loaders
+    # (_load_hourly_df_ground_truth/_load_minute_df/_load_second_df) FROM INSIDE the
+    # worker task body -- each loader's cache is a plain module-level dict, so a worker
+    # process that never inherited an already-populated entry loads (and keeps) its own
+    # full copy for the rest of its life, once per distinct worker that happens to pick
+    # up a task needing it. Confirmed empirically: second-res workers held ~2.85GB RSS
+    # each (independent copies, not shared) capping SECOND_RESOLUTION_MAX_CONCURRENT at
+    # 2; main-pool workers separately held ~0.37GB each x 8 = ~2.96GB of the same
+    # duplication at smaller scale. Populating all three caches HERE, in the main
+    # process, before either ProcessPoolExecutor is created, means every worker forked
+    # afterward inherits the already-loaded data via Linux fork's copy-on-write sharing
+    # (same pattern scripts/phase5_second_level_overlay_check.py's main() already uses
+    # for _DFH/_DF_1M/_DF_1S) -- one real copy total instead of one per worker that
+    # touches this ticker. Second-res preload is wrapped in try/except ValueError,
+    # matching _load_node_inputs_ground_truth's own existing fallback for a ticker with
+    # no active massive_second_derived build -- Phase2.5 still falls back to minute
+    # resolution per-cell in that case, same as before this fix, just without a free
+    # preload to lean on.
+    _load_hourly_df_ground_truth(TICKER, data_source=DATA_SOURCE)
+    _load_minute_df(TICKER, data_source=DATA_SOURCE)
+    try:
+        _load_second_df(TICKER, data_source=DATA_SOURCE)
+    except ValueError as e:
+        print(f"[preload] {TICKER}: {e} -- second-resolution pool workers will fall back "
+              f"to minute resolution per-cell, same as _load_node_inputs_ground_truth's "
+              f"existing fallback.")
 
     _windows_str = ",".join(str(w) for w in WINDOWS)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
