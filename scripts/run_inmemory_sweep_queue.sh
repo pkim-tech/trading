@@ -712,7 +712,29 @@ echo " In-memory sweep queue start — $(date)"
     #   $PYTHON scripts/append_phase5_combined.py --version "$VERSION"
     # ---------------------------------------------------------------------------
 
-    ticker_banner "$JOB_TICKER: full Phase1->4 pipeline complete"
+    # Phase 9 (2026-09-10, per-ticker report + persistence): runs the SAME per-ticker
+    # logic Phase 10 (candidate_full_review_two_tab.py) already has -- this is just that
+    # script called with --tickers scoped to the ONE ticker that just finished Phase1-4,
+    # instead of waiting for the whole campaign to drain. Zero new report-compute code:
+    # reuses build_report()'s existing --tickers filtering. The real payoff is
+    # candidate_full_review.py._write_xlsx's existing _persist_snapshot() call (already
+    # wired on every xlsx write, see that module's 2026-09-03 Part 2 history) -- so this
+    # ticker's real checklist rows land in candidate_full_review_snapshots immediately,
+    # queryable by node_id, instead of only existing once Phase 10 runs at the very end.
+    # Best-effort like Phase4/5 above: a report-generation failure here must not read as
+    # "this ticker's real sweep data failed" -- Phase1-4's work is already persisted by
+    # this point regardless of this call's outcome.
+    ticker_banner "$JOB_TICKER: Phase 9 (candidate_full_review_two_tab.py --tickers $JOB_TICKER) start"
+    $PYTHON scripts/candidate_full_review_two_tab.py --version "$VERSION" --tickers "$JOB_TICKER" \
+      --xlsx "phase9_${JOB_TICKER,,}_${VERSION}"
+    rc9=$?
+    if [ $rc9 -ne 0 ]; then
+      echo "PROGRESS: Phase9 FAILED ticker=$JOB_TICKER: exit code $rc9 -- continuing queue " \
+           "(this ticker's real Phase1-4 data is unaffected; Phase 10's end-of-campaign " \
+           "report will still cover it via a fresh compute)"
+    fi
+
+    ticker_banner "$JOB_TICKER: full Phase1->4 (+9) pipeline complete"
   done
 
   echo ""

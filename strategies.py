@@ -9,6 +9,17 @@ class BaseStrategy:
     sl_axis = 'stop_loss'   # real backtest_cache column the swept 'sl' grid value populates
     fourth_axis = None      # extra swept axis name, or None if the strategy doesn't have one
     uses_fixed_sl = False   # real SL comes from config.execution.fixed_stop_loss, not a grid axis
+    # params_take_profit_key (2026-09-10, promote_candidate.py generalization): the real
+    # candidate_nodes.params_json key holding this strategy's "take_profit arg" concept
+    # signals_db.add_node() expects -- 'take_profit' for most strategies, but the
+    # TrailingBuy/TrailingBoth family calls the same concept 'arm_pct' in params_json
+    # (confirmed against real rows: candidate_nodes id 49622/38604 both TB, key is
+    # 'arm_pct'; id 50073 TE, key is 'take_profit'). add_node() itself already knows to
+    # store this into arm_sell_pct instead of take_profit for TrailingBothZScoreBreakout
+    # specifically -- this attribute is a DIFFERENT, earlier step (which params_json key
+    # to READ), single source of truth so a promotion tool doesn't have to guess via
+    # dict.get() fallback ordering.
+    params_take_profit_key = 'take_profit'
     # uses_arm_trail_exit (2026-09-02, drought-overlay generalization, see backtester.
     # simulate_drought_overlay_ground_truth's own docstring): True only for a strategy that
     # is BOTH (a) shaped like the fixed-SL-then-arm-then-trail state machine the drought
@@ -51,6 +62,16 @@ def resolve_axis_columns(strategy_name):
     if cls is None or not issubclass(cls, BaseStrategy):
         return 'stop_loss', None
     return cls.sl_axis, cls.fourth_axis
+
+
+def params_json_take_profit_key(strategy_name):
+    """The real candidate_nodes.params_json key holding this strategy's take_profit-arg
+    concept for signals_db.add_node() -- see BaseStrategy.params_take_profit_key's own
+    comment. Same fallback-to-BaseStrategy pattern as resolve_axis_columns() above."""
+    cls = globals().get(strategy_name)
+    if cls is None or not issubclass(cls, BaseStrategy):
+        return 'take_profit'
+    return cls.params_take_profit_key
 
 
 def uses_fixed_sl(strategy_name):
@@ -459,6 +480,16 @@ class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
     Mirrors backtester._simulate_trail_both."""
     fourth_axis = 'trail_pct'
     uses_arm_trail_exit = True  # the original strategy this exit machine was designed for
+    # params_take_profit_key='arm_pct' (2026-09-10, paired-review MEDIUM fix): placed
+    # HERE, not on the parent TrailingBuyZScoreBreakout -- confirmed against the real
+    # params_json writer (scripts/node_key.py's build_params_dict), which special-cases
+    # this key ONLY for strategy_name == 'TrailingBothZScoreBreakout' by exact name.
+    # TrailingBuyZScoreBreakout's own check_exit (this class overrides it below) is a
+    # genuine fixed-TP exit, not the arm/trail machine -- its real params_json key is
+    # 'take_profit' like any other non-arm/trail strategy, inherited correctly from
+    # BaseStrategy's own default. Putting the override one class too high was the
+    # independent-cold reviewer's real, confirmed finding on this diff's first version.
+    params_take_profit_key = 'arm_pct'
 
     def check_exit(self, ctx):
         ep = ctx['entry_price']
