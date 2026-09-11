@@ -310,11 +310,46 @@ def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, des
     def _record(task, future_or_none, res_or_exc):
         tp, sl, hold_hours, w, z_thresh, tpct = task
         if isinstance(res_or_exc, Exception):
+            # Live error-rate visibility (2026-09-11, backlog item -- a suspiciously fast
+            # stage completion was the only clue tonight to a majority of AGQ fixed_sl=3/4's
+            # Phase2.5-cliffbox cells failing with status='ERROR' under memory pressure (the
+            # 1s load raises, _record files it into fail_counts and emits no df25 row, so the
+            # coordinate's cliff-safety neighbor falls through to the Phase1/Phase2 minute
+            # row -- NOT a per-cell SUCCESS-with-downgraded-fill_resolution='minute', a
+            # different, still-uninstrumented case caught downstream by the
+            # worst_neighbor_cagr resolution check instead; comment corrected 2026-09-11,
+            # paired-review MEDIUM finding, after an earlier version conflated the two).
+            # fail_counts was already tracked here but only ever printed once, at the very
+            # end. `progress` is resolved via closure -- _record is only ever called from
+            # inside the loops below, after `progress` is assigned, in both the unthrottled
+            # (as_completed) and throttled (bounded-submission) branches, so one copy of this
+            # call covers both shapes.
+            #
+            # refresh=(key not in fail_counts BEFORE the increment) (2026-09-11, paired-
+            # review HIGH finding, confirmed on rebuttal by both an independent-cold and a
+            # contextual Opus review, verified directly against the real incident log): a
+            # plain refresh=False is respectful of this bar's own mininterval=15.0 throttle
+            # but is SELF-DEFEATING for exactly the mass-failure case this exists to catch --
+            # an erroring cell short-circuits before simulation and returns ~250x faster than
+            # a real one, so a stage failing at scale finishes in seconds, well under one
+            # mininterval window, and the deferred postfix never gets a chance to render
+            # before close() -- confirmed against logs/inmemory_sweep_queue_20260910_091832.log,
+            # where the real AGQ fixed_sl=3 stage (1,771 ERRORs) ran end-to-end in 10.0s with
+            # exactly two renders (0% and close()'s 100%), so a refresh=False postfix would
+            # have landed at the SAME instant as the pre-existing end-of-stage print -- zero
+            # net new visibility. Forcing a refresh only on each distinct status key's first
+            # occurrence bounds forced redraws to the handful of real status values a worker
+            # can return (well under 10), while still surfacing the very first failure within
+            # milliseconds instead of only at stage completion.
+            first = "CRASH" not in fail_counts
             fail_counts["CRASH"] = fail_counts.get("CRASH", 0) + 1
+            progress.set_postfix(fail_counts, refresh=first)
             return
-        status = res_or_exc.get("status")
+        status = str(res_or_exc.get("status"))
         if status != "SUCCESS":
+            first = status not in fail_counts
             fail_counts[status] = fail_counts.get(status, 0) + 1
+            progress.set_postfix(fail_counts, refresh=first)
             return
         alpha, num_trades, wr, comp_ret, wtw, node_cagr = res_or_exc["payload"]
         rows.append({
@@ -388,7 +423,19 @@ def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, des
 
     progress.close()
     if fail_counts:
-        print(f"  non-SUCCESS statuses: {fail_counts}")
+        # Proportional, scrollback-durable severity signal (2026-09-11, paired-review HIGH
+        # finding -- contextual Opus review, against the real incident log): the plain
+        # {fail_counts} dict WAS already printed here the night of the real AGQ incident
+        # (confirmed: logs/inmemory_sweep_queue_20260910_091832.log shows "non-SUCCESS
+        # statuses: {'ERROR': 5183}" for a 6,920-cell stage) and was STILL missed -- the
+        # gap that actually mattered wasn't visibility timing, it was that a 75%-failure
+        # stage read no differently on the page than a handful of expected fringe misses.
+        # A loud, greppable tag on a high failure fraction is the load-bearing half of this
+        # fix; the live progress-bar postfix above is the complementary nice-to-have.
+        total_failed = sum(fail_counts.values())
+        frac = total_failed / len(tasks) if tasks else 0.0
+        tag = "  *** HIGH FAILURE RATE ***" if frac >= 0.25 else ""
+        print(f"  non-SUCCESS statuses: {fail_counts} ({total_failed:,}/{len(tasks):,} = {frac:.0%}){tag}")
     return rows
 
 
