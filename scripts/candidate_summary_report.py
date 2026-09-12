@@ -72,6 +72,7 @@ from run_overlay_shim import (
     run_for_node as run_overlay_for_node, ensure_candidate_nodes_table, ensure_table as ensure_overlay_table,
 )
 from datetime import datetime as _datetime
+import db_cache
 
 # run_optimization_sweep/campaign_config/prune_backtest_cache_ground_truth (GT-mode-only
 # deps) are deliberately NOT imported at module level -- run_optimization_sweep.py runs
@@ -1497,56 +1498,6 @@ def _run_one_gt_scope_worker(db_path, ticker, strategy, version, entry_timing, f
     return buf.getvalue(), rows, error
 
 
-GT_WORKERS_CAP_ROW_THRESHOLD = 15_000_000
-GT_WORKERS_CAPPED_VALUE = 4
-
-
-def resolve_effective_gt_workers(conn, massive_tickers, requested_workers):
-    """Row-count-keyed effective-workers cap for run_gt_mode's outer per-scope pool
-    (2026-09-11, scripts/calibrate_gt_workers.py dispatch). Real mechanism is per-worker
-    cache/state growth (_SECOND_DF_CACHE etc.) ACROSS a long-lived worker's many
-    sequential candidates, not a single call's peak memory -- confirmed via
-    calibrate_gt_workers.py's --sustained mode, which showed per-worker PSS growth over
-    15 candidates scaling with ticker row count (AGQ +0.24GB/worker, TNA +0.47GB/worker)
-    and SOXL at workers=8 genuinely exceeding safe memory under that realistic sustained
-    load (a real, non-instant trip -- distinct from a single-cell test, which showed no
-    ceiling at all for any of the three tickers). Keyed on real active-build row count
-    (not a hardcoded ticker name) so any other ticker that grows into SOXL's row-count
-    range later is covered automatically, and so AGQ/TNA-scale tickers aren't penalized
-    by a blanket low default. Threshold picked from the actual measured growth rates:
-    TNA (11.4M rows) stayed safe under sustained load, SOXL (22.2M) did not --
-    GT_WORKERS_CAP_ROW_THRESHOLD splits the two clusters.
-
-    `massive_tickers`: real tickers in this run whose scopes use data_source='massive'
-    (only those load second-resolution data at all -- a yahoo-sourced scope never hits
-    this growth path). Below the threshold, `requested_workers` is returned as-is;
-    above it, capped at GT_WORKERS_CAPPED_VALUE regardless of what was requested."""
-    if not massive_tickers:
-        return requested_workers
-    placeholders = ",".join("?" for _ in massive_tickers)
-    row_counts = dict(conn.execute(f"""
-        SELECT m.ticker, COUNT(*) FROM massive_second_derived m
-        JOIN active_builds ab ON ab.ticker = m.ticker AND ab.table_name = 'second'
-                              AND ab.build_id = m.build_id
-        WHERE m.ticker IN ({placeholders})
-        GROUP BY m.ticker
-    """, list(massive_tickers)).fetchall())
-    if not row_counts:
-        return requested_workers
-    worst_ticker = max(row_counts, key=row_counts.get)
-    worst_rows = row_counts[worst_ticker]
-    if worst_rows > GT_WORKERS_CAP_ROW_THRESHOLD and requested_workers > GT_WORKERS_CAPPED_VALUE:
-        print(f"[workers cap] {worst_ticker}: capped --workers {requested_workers} -> "
-              f"{GT_WORKERS_CAPPED_VALUE} -- active massive_second_derived row count "
-              f"{worst_rows:,} exceeds the sustained-load-safe threshold "
-              f"({GT_WORKERS_CAP_ROW_THRESHOLD:,}); per-worker cache/state growth across "
-              f"a long multi-candidate run scales with ticker row count (see "
-              f"scripts/calibrate_gt_workers.py --sustained), not just a single call's "
-              f"peak memory.")
-        return GT_WORKERS_CAPPED_VALUE
-    return requested_workers
-
-
 def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_window_filter=None,
                  version_filter=None, db_path=None, workers=4):
     """--kernel gt entry point: loops every real GT scope for `tickers`, printing
@@ -1792,7 +1743,7 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
                               f"truth's own fallback.")
 
         _massive_tickers = [t for t, ds in _preload_pairs if ds == "massive"]
-        effective_workers = resolve_effective_gt_workers(conn, _massive_tickers, workers)
+        effective_workers = db_cache.resolve_effective_gt_workers(_massive_tickers, workers, conn=conn)
 
         with ProcessPoolExecutor(max_workers=effective_workers) as pool:
             campaign_registry.run_throttled(pool, _submit_scope, _indexed_scopes, budget_version,
