@@ -11,6 +11,15 @@ Used by `feature wrap` and `session wrap` before committing.
 - [ ] `.venv/bin/python scripts/check_backlog_cache_lean.py` — flags any `backlog_cache.md` entry
       over 2 lines (detection only; fix by relocating the full writeup to `deep_backlog.md` and
       leaving a one-line pointer, not by running a script unattended — see that script's docstring)
+- No manual step needed — `scripts/backlog_lint.py` runs automatically via `.git/hooks/pre-commit`
+      (added 2026-09-12) and rejects a commit if a newly-added `backlog_cache.md`/`deep_backlog.md`
+      header uses a tag outside the known vocabulary (built after finding 94 distinct tags, many
+      one-off/likely typos, across both files). Only checks new header lines in the diff, not the
+      whole file. If a commit gets rejected for a genuinely new, deliberate tag, add it to
+      `KNOWN_TAGS` in that script rather than bypassing; `git commit --no-verify` is the escape
+      hatch for a real emergency, not routine use. **Not committed to the repo** — `.git/hooks/`
+      isn't version-controlled, so this only applies to this clone/worktree; a fresh `git clone`
+      elsewhere won't have it until someone re-creates the hook file.
 - [ ] `readme.md` updated if layer behavior changed
 - [ ] Staged files reviewed — nothing unexpected included
 - [ ] `.venv/bin/python signals_invariants.py` — config-invariant sanity check (currently: every
