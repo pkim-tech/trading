@@ -25,9 +25,20 @@ SAME real candidate coordinate concurrently and watches summed worker RSS via ps
 (same watchdog rationale as before: kill this one attempt early -- before a real OOM --
 if projected memory use would exceed headroom, log "would have OOM'd", move on).
 
+Sustained-load mode (--sustained, added 2026-09-11, research(3) peer review): the
+single-cell test above only captures ONE call's peak PSS per worker, a few seconds --
+it can't see whether a per-worker module-level cache (_SECOND_DF_CACHE, _HOURLY_DF_
+CACHE_GT) or numba JIT state grows across many candidates processed sequentially by
+the SAME long-lived worker, the way a real run_gt_mode campaign actually runs (each
+outer-pool worker resimulates many scopes/candidates over tens of minutes, not one).
+--sustained has each worker process N real distinct candidate_nodes rows for the
+ticker in a loop, self-reporting its own process's PSS after every candidate, so
+growth across a worker's lifetime is visible even when a single call's peak looks flat.
+
 Usage:
   .venv/bin/python scripts/calibrate_gt_workers.py --ticker AGQ --try 8 10
   .venv/bin/python scripts/calibrate_gt_workers.py --ticker SOXL --try 8 6 4 2
+  .venv/bin/python scripts/calibrate_gt_workers.py --ticker SOXL --try 8 --sustained --candidates-per-worker 15
   .venv/bin/python scripts/calibrate_gt_workers.py --report
 """
 import argparse
@@ -92,6 +103,33 @@ def _build_cell_args(ticker):
             cfg["data_source"], True, "second")
 
 
+def _candidate_rows_from_db(ticker, limit=20):
+    """Real distinct candidate_nodes rows for `ticker` -- for --sustained mode, so each
+    worker resimulates genuinely different coordinates across its loop (not the same
+    cell N times, which a per-coordinate cache could trivially short-circuit)."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cur = conn.execute("""
+            SELECT strategy, window, z, fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
+                   max_hold_hours, entry_timing
+            FROM candidate_nodes WHERE ticker=? ORDER BY id DESC LIMIT ?
+        """, (ticker, limit))
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _cell_args_from_row(ticker, row, spy_bh, data_source):
+    strategy, w, z, fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct, hold, entry_timing = row
+    is_both = strategy == "TrailingBothZScoreBreakout"
+    if is_both:
+        tp, sl, tpct = arm_pct, trail_buy_pct, trail_sell_pct
+    else:
+        tp, sl, tpct = arm_pct, trail_sell_pct, trail_sell_pct
+    return (ticker, strategy, tp, sl, hold, w, z, fixed_sl, tpct, entry_timing, None, None,
+            spy_bh, None, data_source, True, "second")
+
+
 def _preload(ticker):
     """Preload-before-fork, same call shape run_addon_cliff_safety_ground_truth uses."""
     import run_optimization_sweep as ros
@@ -121,6 +159,26 @@ def _proc_tree_rss(proc):
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return total
+
+
+def _force_kill_children(proc):
+    """pool.shutdown(wait=False, cancel_futures=True) only cancels futures that haven't
+    STARTED yet -- it does NOT terminate already-running worker processes, which keep
+    executing (and keep growing memory) until they finish on their own. Confirmed
+    2026-09-11: a SOXL sustained-load would_oom trip took 27s+ to actually resolve this
+    way, during which real system `used` climbed to 21GB/23GB with swap active -- a real
+    near-miss on this shared machine, not a hypothetical one. Must SIGKILL every child
+    directly for an OOM-risk abort to actually mean "stop growing memory now"."""
+    try:
+        children = proc.children(recursive=True)
+    except psutil.NoSuchProcess:
+        return
+    for child in children:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            continue
+    psutil.wait_procs(children, timeout=10)
 
 
 def run_one_attempt(ticker, workers):
@@ -160,6 +218,7 @@ def run_one_attempt(ticker, workers):
                           f"headroom={headroom_bytes/1e9:.2f}GB. Killing early.", flush=True)
                     for f in futures:
                         f.cancel()
+                    _force_kill_children(this_proc)
                     pool.shutdown(wait=False, cancel_futures=True)
                     outcome = "would_oom"
                     break
@@ -194,6 +253,116 @@ def _run_cell_isolated_entrypoint(args):
     return _run_addon_cliff_cell_isolated(args)
 
 
+def _run_cell_loop_entrypoint(args_list):
+    """Runs inside ONE long-lived worker process, same as a real run_gt_mode outer-pool
+    worker resimulating many scopes/candidates sequentially over its lifetime. Self-
+    reports this process's own PSS (no children -- this process itself is the leaf, no
+    fork double-counting to worry about) after every candidate, so a per-worker cache/
+    JIT-state growth trend is visible even when a single call's peak looks flat."""
+    import psutil as _psutil
+    from run_optimization_sweep import _run_addon_cliff_cell_isolated
+    self_proc = _psutil.Process()
+    trace = []
+    t0 = time.monotonic()
+    for i, cell_args in enumerate(args_list):
+        try:
+            _run_addon_cliff_cell_isolated(cell_args)
+        except Exception:
+            pass
+        trace.append({"i": i, "pss_bytes": self_proc.memory_full_info().pss,
+                       "elapsed": round(time.monotonic() - t0, 1)})
+    return trace
+
+
+def run_sustained_attempt(ticker, workers, candidates_per_worker):
+    """Each of `workers` long-lived worker processes resimulates `candidates_per_worker`
+    real, distinct candidate_nodes coordinates in a sequential loop -- the fidelity gap
+    research(3) flagged in the single-cell test above. Returns per-worker PSS traces
+    plus the same external tree-PSS OOM watchdog as run_one_attempt."""
+    total_mem = psutil.virtual_memory().total
+    headroom_bytes = int(total_mem * MEMORY_HEADROOM_FRACTION)
+    this_proc = psutil.Process()
+    baseline_other_used = psutil.virtual_memory().used - _proc_tree_rss(this_proc)
+
+    cfg = CANDIDATES[ticker]
+    print(f"[{ticker} workers={workers} sustained] preloading...", flush=True)
+    _preload(ticker)
+    import run_optimization_sweep as ros
+    _, spy_bh = ros.compute_bh_returns(ticker, data_source=cfg["data_source"])
+
+    rows = _candidate_rows_from_db(ticker, limit=max(candidates_per_worker, 20))
+    if not rows:
+        raise ValueError(f"no candidate_nodes rows found for {ticker}")
+    n_total = workers * candidates_per_worker
+    cycled_rows = [rows[i % len(rows)] for i in range(n_total)]
+    all_args = [_cell_args_from_row(ticker, r, spy_bh, cfg["data_source"]) for r in cycled_rows]
+    worker_chunks = [all_args[w * candidates_per_worker:(w + 1) * candidates_per_worker]
+                     for w in range(workers)]
+
+    print(f"[{ticker} workers={workers} sustained] dispatching {workers} worker(s), "
+          f"{candidates_per_worker} candidates each...", flush=True)
+    start = time.monotonic()
+    peak_rss = 0
+    outcome = "ok"
+    error_text = None
+    worker_traces = []
+    ctx = multiprocessing.get_context("fork")
+    try:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+            futures = [pool.submit(_run_cell_loop_entrypoint, chunk) for chunk in worker_chunks]
+            while True:
+                done = all(f.done() for f in futures)
+                tree_rss = _proc_tree_rss(this_proc)
+                peak_rss = max(peak_rss, tree_rss)
+                projected_used = baseline_other_used + tree_rss
+                if projected_used >= total_mem - headroom_bytes:
+                    print(f"[{ticker} workers={workers} sustained] WOULD HAVE OOM'D -- "
+                          f"tree_rss={tree_rss/1e9:.2f}GB other_used="
+                          f"{baseline_other_used/1e9:.2f}GB total={total_mem/1e9:.2f}GB "
+                          f"headroom={headroom_bytes/1e9:.2f}GB. Killing early.", flush=True)
+                    for f in futures:
+                        f.cancel()
+                    _force_kill_children(this_proc)
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    outcome = "would_oom"
+                    break
+                if done:
+                    break
+                time.sleep(POLL_INTERVAL_SECONDS)
+            if outcome == "ok":
+                for f in as_completed(futures):
+                    try:
+                        worker_traces.append(f.result())
+                    except Exception as e:
+                        outcome = "error"
+                        error_text = repr(e)
+    except Exception as e:
+        outcome = "error"
+        error_text = repr(e)
+
+    elapsed = time.monotonic() - start
+    growth_per_worker = []
+    if worker_traces:
+        for trace in worker_traces:
+            if len(trace) >= 2:
+                first_pss = trace[0]["pss_bytes"]
+                last_pss = trace[-1]["pss_bytes"]
+                growth_per_worker.append(round((last_pss - first_pss) / 1e9, 3))
+        print(f"[{ticker} workers={workers} sustained] per-worker PSS growth "
+              f"(last - first candidate, GB): {growth_per_worker}", flush=True)
+
+    result = {
+        "ticker": ticker, "workers": workers, "outcome": outcome, "mode": "sustained",
+        "candidates_per_worker": candidates_per_worker, "peak_rss_bytes": peak_rss,
+        "elapsed_seconds": round(elapsed, 1), "growth_per_worker_gb": growth_per_worker,
+    }
+    if error_text:
+        result["error"] = error_text
+    print(f"[{ticker} workers={workers} sustained] outcome={outcome} "
+          f"peak_rss={peak_rss/1e9:.2f}GB elapsed={elapsed:.1f}s", flush=True)
+    return result
+
+
 def load_results():
     if RESULTS_PATH.exists():
         return json.loads(RESULTS_PATH.read_text())
@@ -212,10 +381,14 @@ def print_report():
     if not results:
         print("No results yet.")
         return
+    single_cell = [r for r in results if r.get("mode") != "sustained"]
+    sustained = [r for r in results if r.get("mode") == "sustained"]
+
     by_ticker = {}
-    for r in results:
+    for r in single_cell:
         by_ticker.setdefault(r["ticker"], []).append(r)
 
+    print("-- single-cell (one call per worker) --")
     print(f"{'ticker':<8}{'active_rows':>14}{'safe_max_workers':>18}{'peak_rss_gb':>14}")
     for ticker, attempts in by_ticker.items():
         rows = real_active_row_count(ticker)
@@ -225,6 +398,15 @@ def print_report():
                              if a["workers"] == safe_max), 0)
         print(f"{ticker:<8}{rows:>14}{str(safe_max):>18}{peak_at_safe/1e9:>13.2f}G")
 
+    if sustained:
+        print("\n-- sustained (many candidates/worker, per-worker PSS growth) --")
+        print(f"{'ticker':<8}{'workers':>8}{'cands/worker':>13}{'outcome':>12}"
+              f"{'peak_rss_gb':>13}  growth_per_worker_gb")
+        for r in sustained:
+            print(f"{r['ticker']:<8}{r['workers']:>8}{r.get('candidates_per_worker', ''):>13}"
+                  f"{r['outcome']:>12}{r['peak_rss_bytes']/1e9:>12.2f}G  "
+                  f"{r.get('growth_per_worker_gb', [])}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -232,6 +414,11 @@ def main():
     ap.add_argument("--try", dest="workers_values", type=int, nargs="+",
                      help="--workers values to attempt, in order")
     ap.add_argument("--report", action="store_true", help="print results table and exit")
+    ap.add_argument("--sustained", action="store_true",
+                     help="test sustained per-worker load (many candidates/worker) instead "
+                          "of one isolated cell -- see module docstring")
+    ap.add_argument("--candidates-per-worker", type=int, default=15,
+                     help="--sustained only: real candidates each worker processes sequentially")
     args = ap.parse_args()
 
     if args.report:
@@ -245,7 +432,10 @@ def main():
     print(f"{args.ticker}: {rows} active-build rows in massive_second_derived")
 
     for workers in args.workers_values:
-        result = run_one_attempt(args.ticker, workers)
+        if args.sustained:
+            result = run_sustained_attempt(args.ticker, workers, args.candidates_per_worker)
+        else:
+            result = run_one_attempt(args.ticker, workers)
         result["row_count"] = rows
         save_result(result)
         if result["outcome"] != "ok":
