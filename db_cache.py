@@ -1294,6 +1294,83 @@ def get_massive_hourly_ohlcv(ticker, build_id=None):
     return df
 
 
+GT_WORKERS_CAP_ROW_THRESHOLD = 15_000_000
+GT_WORKERS_CAPPED_VALUE = 4
+
+
+def resolve_effective_gt_workers(massive_tickers, requested_workers, conn=None):
+    """Row-count-keyed effective-workers cap for a ProcessPoolExecutor that resimulates
+    real GT candidates at second resolution (2026-09-11, scripts/calibrate_gt_workers.py
+    dispatch -- originally built for candidate_summary_report.run_gt_mode's outer
+    per-scope pool, moved here 2026-09-11 so bench_phase1_phase2_inmemory.py's
+    Phase2.5-cliffbox second-resolution pool -- the same underlying growth risk, a
+    different call site -- can share it instead of duplicating the threshold/logic).
+
+    Real mechanism: per-worker cache/state growth (_SECOND_DF_CACHE etc.) ACROSS a
+    long-lived worker's many sequential candidates, not a single call's peak memory --
+    confirmed via calibrate_gt_workers.py's --sustained mode, which showed per-worker
+    PSS growth over 15 candidates scaling with ticker row count (AGQ +0.24GB/worker,
+    TNA +0.47GB/worker) and SOXL at workers=8 genuinely exceeding safe memory under
+    that realistic sustained load (a real, non-instant trip -- distinct from a
+    single-cell test, which showed no ceiling at all for any of the three tickers).
+    Keyed on real active-build row count (not a hardcoded ticker name) so any other
+    ticker that grows into SOXL's row-count range later is covered automatically, and
+    so AGQ/TNA-scale tickers aren't penalized by a blanket low default. Threshold
+    picked from the actual measured growth rates: TNA (11.4M rows) stayed safe under
+    sustained load, SOXL (22.2M) did not -- GT_WORKERS_CAP_ROW_THRESHOLD splits the
+    two clusters.
+
+    `massive_tickers`: real tickers in this run whose scopes use data_source='massive'
+    (only those load second-resolution data at all -- a yahoo-sourced scope never hits
+    this growth path). Below the threshold, `requested_workers` is returned as-is;
+    above it, capped at GT_WORKERS_CAPPED_VALUE regardless of what was requested.
+    `conn`: optional caller-managed connection; default (None) opens its own against
+    this module's DB_PATH with a real timeout=60.0 (NOT _connect_or_reuse's plain
+    sqlite3.connect(), which has only sqlite3's 5s default busy timeout) -- this call
+    sits on bench_phase1_phase2_inmemory.py's Phase2.5 dispatch critical path, a real
+    multi-hour run, so a lock/IO error here must not propagate and kill it (same
+    fail-soft posture as campaign_registry.get_workers_budget, added 2026-08-31 after
+    exactly that failure mode: an unhandled DB exception killed a bench process,
+    discarding hours of completed in-memory work -- paired-review finding, both
+    reviewers, 2026-09-11)."""
+    if not massive_tickers:
+        return requested_workers
+    owns = conn is None
+    try:
+        c = conn if conn is not None else sqlite3.connect(DB_PATH, timeout=60.0)
+        try:
+            placeholders = ",".join("?" for _ in massive_tickers)
+            row_counts = dict(c.execute(f"""
+                SELECT m.ticker, COUNT(*) FROM massive_second_derived m
+                JOIN active_builds ab ON ab.ticker = m.ticker AND ab.table_name = 'second'
+                                      AND ab.build_id = m.build_id
+                WHERE m.ticker IN ({placeholders})
+                GROUP BY m.ticker
+            """, list(massive_tickers)).fetchall())
+        finally:
+            if owns:
+                c.close()
+    except sqlite3.Error as e:
+        print(f"[workers cap] row-count lookup failed ({e!r}) -- not capping, "
+              f"using requested --workers={requested_workers} as-is (fail-soft, same "
+              f"posture as campaign_registry.get_workers_budget).")
+        return requested_workers
+    if not row_counts:
+        return requested_workers
+    worst_ticker = max(row_counts, key=row_counts.get)
+    worst_rows = row_counts[worst_ticker]
+    if worst_rows > GT_WORKERS_CAP_ROW_THRESHOLD and requested_workers > GT_WORKERS_CAPPED_VALUE:
+        print(f"[workers cap] {worst_ticker}: capped --workers {requested_workers} -> "
+              f"{GT_WORKERS_CAPPED_VALUE} -- active massive_second_derived row count "
+              f"{worst_rows:,} exceeds the sustained-load-safe threshold "
+              f"({GT_WORKERS_CAP_ROW_THRESHOLD:,}); per-worker cache/state growth across "
+              f"a long multi-candidate run scales with ticker row count (see "
+              f"scripts/calibrate_gt_workers.py --sustained), not just a single call's "
+              f"peak memory.")
+        return GT_WORKERS_CAPPED_VALUE
+    return requested_workers
+
+
 if __name__ == "__main__":
     refresh_dropdown_cache()
     refresh_pivot_cache()

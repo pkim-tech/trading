@@ -43,6 +43,9 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
+## [backtest] Raised 2026-09-11 — run_addon_cliff_safety_ground_truth's own pool (run_optimization_sweep.py:3669) is NOT row-count-capped, unlike run_gt_mode/bench's second-res pools
+Confirmed via paired-review rebuttal (worktree-second-res-pool-workers-cap): `run_candidate_nodes_campaign_verification.py --ticker SOXL --workers 8` (`--workers` default 6, :231/:262) and `candidate_full_review.py` (`addon_cliff_workers=6` default, :1718) both thread straight into this uncapped pool -- SOXL's real active `massive_second_derived` row count (22.2M) exceeds `db_cache.GT_WORKERS_CAP_ROW_THRESHOLD` (15M), the exact calibrated-unsafe-under-sustained-load workload (`_run_addon_cliff_cell_isolated`) `scripts/calibrate_gt_workers.py --sustained` measured tonight. `run_gt_mode` is only safe because `_run_one_gt_scope_worker` pins `addon_cliff_workers=1`. Fix (scoped, not yet built): call `db_cache.resolve_effective_gt_workers([ticker], workers)` inside `run_addon_cliff_safety_ground_truth` before creating its pool, gated on `data_source=="massive"`/`fill_resolution=="second"`. Touches run_optimization_sweep.py (backtest kernel module) -- needs its own paired independent-cold + contextual Opus review, not folded into tonight's bench_phase1_phase2_inmemory.py fix (a562... commit) since it's a different file/gate. Not yet urgent-blocking (Phase4 verification is a separate manual step from the sweep pipeline, not auto-triggered by campaign_id=22), but real and cheap to close.
+
 ## [backtest][tooling] Raised 2026-09-11 — no display/grouping design for the 20 new overlay-risk-check columns (`6f1741f`, committed)
 Which combos matter for which promotion decision, how to group 20 columns, how to flag sparse-fold (`n_folds_populated`). Full detail: `deep_backlog.md`.
 

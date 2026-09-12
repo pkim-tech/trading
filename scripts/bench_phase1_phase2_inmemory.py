@@ -234,11 +234,25 @@ SECOND_RESOLUTION_MAX_CONCURRENT = None
 _SECOND_RES_POOL = None
 
 
-def _get_second_resolution_pool(max_workers):
+def _get_second_resolution_pool(max_workers, ticker=None):
+    """ticker (2026-09-11, real regression fix -- same underlying per-worker cache/state
+    growth risk scripts/candidate_summary_report.py's run_gt_mode had, see
+    db_cache.resolve_effective_gt_workers's own docstring for the full mechanism and the
+    calibration data behind it): SECOND_RESOLUTION_MAX_CONCURRENT was set to None earlier
+    tonight (removing the old hardcoded cap of 2, "follows --workers"), which reopened
+    this pool to the exact same SOXL-scale sustained-load risk -- a fresh SOXL run
+    exercises this exact pool. This pool is a module-level singleton created ONCE per
+    process (first call wins, `size` is ignored on every later call) -- correct for the
+    real one-ticker-per-process campaign model this file's callers actually use, but
+    means `ticker` here must be the real ticker this process is running, not an arbitrary
+    caller's own scope ticker. Only applies the cap when `ticker` is given (a caller that
+    can't supply one falls back to the pre-fix, uncapped-by-row-count behavior)."""
     global _SECOND_RES_POOL
     if _SECOND_RES_POOL is None:
         size = (max_workers if SECOND_RESOLUTION_MAX_CONCURRENT is None
                  else min(SECOND_RESOLUTION_MAX_CONCURRENT, max_workers))
+        if ticker is not None:
+            size = db_cache.resolve_effective_gt_workers([ticker], size)
         _SECOND_RES_POOL = ProcessPoolExecutor(max_workers=size)
     return _SECOND_RES_POOL
 
@@ -297,7 +311,7 @@ def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, des
     # every other reference in this function to "the pool" below means dispatch_pool, not
     # the caller's shared one, so the throttle math (budget vs. max_workers) is scoped to
     # whichever pool is actually doing the work.
-    dispatch_pool = (_get_second_resolution_pool(pool._max_workers)
+    dispatch_pool = (_get_second_resolution_pool(pool._max_workers, ticker=ticker)
                       if fill_resolution == "second" else pool)
     max_workers = dispatch_pool._max_workers
 
