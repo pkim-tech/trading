@@ -1548,6 +1548,7 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
     behavior unchanged; only a real single-version campaign run (run_inmemory_sweep_
     queue.sh always passes --version) gets the tightened, Phase5-matching scoping."""
     from phase4_candidate_nodes_resolver import discover_all_candidate_nodes_scopes
+    import run_optimization_sweep as ros
 
     _bc_scopes = gt_scopes_for_tickers(conn, tickers)
     if version_filter is not None:
@@ -1665,6 +1666,81 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
             _pending[idx] = (captured_output, rows)
             _emit_ready()
 
+        # Preload-before-fork (2026-09-11, third real instance of this bug class this
+        # session -- same pattern as bench_phase1_phase2_inmemory.py's main() and
+        # run_optimization_sweep.py's run_addon_cliff_safety_ground_truth, both fixed
+        # earlier tonight). Each _run_one_gt_scope_worker independently calls into
+        # gt_rows_for_scope -> _load_node_inputs_ground_truth, which loads this scope's
+        # ticker's hourly/minute/second dataframes into a plain module-level cache dict
+        # PER PROCESS -- a worker that never inherited an already-populated cache loads
+        # (and keeps) its own private copy for the rest of its life. Unlike the other two
+        # fixes, this pool parallelizes across SCOPES, which can span multiple tickers
+        # (and, per-scope, multiple data_source values -- data_source is derived from
+        # each scope's own version string, see gt_rows_for_scope's own
+        # `"massive" if "-massive" in version else "yahoo"` resolution a few lines above
+        # this function). So the preload here is keyed per (ticker, data_source) pair
+        # actually present in `scopes`, built in this (parent) process before the pool
+        # is created -- every worker forked afterward inherits whichever of these pairs
+        # its own scope needs via copy-on-write, instead of loading it itself.
+        #
+        # Bounded to _SECOND_DF_CACHE_MAX distinct pairs (paired-review CONFIRMED HIGH/
+        # MEDIUM, both independent-cold and contextual Opus reviewers, same finding from
+        # each): every one of these loader caches clears its ENTIRE dict on overflow
+        # rather than evicting one entry (see _HOURLY_DF_CACHE_GT_MAX/_MINUTE_DF_CACHE_
+        # MAX/_SECOND_DF_CACHE_MAX in run_optimization_sweep.py), so preloading more
+        # pairs than the tightest cap (_SECOND_DF_CACHE_MAX=2) would have each new
+        # pair's load evict the previous one -- only the last ~2 pairs would still be
+        # cached by the time the pool forks, while every pair still paid its full
+        # serial parent-side load cost (a real ~1GB second-resolution frame at SOXL
+        # scale) for no COW-sharing benefit, plus startup latency that used to be
+        # parallel across workers. A multi-ticker/--tranche run is a real path (see
+        # this function's own `budget_version` comment above), so this isn't a
+        # theoretical edge case. Above the cap, skip preloading entirely and let every
+        # worker load its own scope's data independently -- exactly this function's
+        # pre-fix behavior, not a regression.
+        _preload_pairs = {(s[0], "massive" if "-massive" in s[2] else "yahoo") for s in scopes}
+        if len(_preload_pairs) > ros._SECOND_DF_CACHE_MAX:
+            print(f"[preload] skipping preload-before-fork: {len(_preload_pairs)} distinct "
+                  f"(ticker, data_source) pair(s) exceeds _SECOND_DF_CACHE_MAX="
+                  f"{ros._SECOND_DF_CACHE_MAX} -- preloading all of them would just evict each "
+                  f"other before the pool forks. Each worker will load its own scope's data "
+                  f"independently, same as before this fix.")
+        else:
+            for _pl_ticker, _pl_data_source in sorted(_preload_pairs):
+                # Contained per-pair, same posture as _run_one_gt_scope_worker's own
+                # per-scope containment (paired-review CONFIRMED HIGH, independent-cold
+                # reviewer): a ticker with no active massive hourly/minute build, or no
+                # yahoo CSV on disk, previously only failed THAT scope (caught inside
+                # _run_one_gt_scope_worker's own try/except, returned as an error row
+                # with output preserved) -- an uncaught preload failure here would abort
+                # the whole run_gt_mode batch before a single scope even ran, for a
+                # ticker that might not even be the one causing trouble. Skipping this
+                # pair's preload on failure just falls back to the pre-fix behavior for
+                # it (each worker needing it loads its own copy, and hits/handles the
+                # same failure independently, contained to its own scope).
+                try:
+                    ros._load_hourly_df_ground_truth(_pl_ticker, data_source=_pl_data_source)
+                    ros._load_minute_df(_pl_ticker, data_source=_pl_data_source)
+                except (ValueError, FileNotFoundError) as e:
+                    print(f"[preload] {_pl_ticker}/{_pl_data_source}: hourly/minute preload "
+                          f"failed ({e}) -- skipping preload for this pair.")
+                    continue
+                # yahoo has no second-resolution equivalent -- _load_second_df always
+                # raises ValueError for data_source != 'massive' (paired-review LOW,
+                # both reviewers: an earlier version called this unconditionally,
+                # printing a misleading "will fall back to minute" message for every
+                # yahoo pair even though those scopes never request second resolution
+                # at all -- see build_candidate_report_ground_truth's own
+                # data_source == 'massive' gate on _resim_fill_resolution).
+                if _pl_data_source == "massive":
+                    try:
+                        ros._load_second_df(_pl_ticker, data_source=_pl_data_source)
+                    except ValueError as e:
+                        print(f"[preload] {_pl_ticker}/{_pl_data_source}: {e} -- workers "
+                              f"needing second-resolution data for this ticker will fall "
+                              f"back to minute per-cell, same as _load_node_inputs_ground_"
+                              f"truth's own fallback.")
+
         with ProcessPoolExecutor(max_workers=workers) as pool:
             campaign_registry.run_throttled(pool, _submit_scope, _indexed_scopes, budget_version,
                                              _on_scope_result)
@@ -1736,10 +1812,17 @@ def main():
                           "(2026-08-31, Task #8 further follow-up -- this loop previously had "
                           "zero parallelism at all). Actual in-flight concurrency is additionally "
                           "gated by the resolved campaign's workers_budget, if any -- see "
-                          "scripts/campaign_registry.py. Default 4: this loop is DB-I/O + moderate-"
-                          "compute bound, not the numba-JIT-heavy Phase1-2.5 kernel, so a smaller "
-                          "default than bench_phase1_phase2_inmemory.py's --workers 8 convention "
-                          "is deliberate, not an oversight.")
+                          "scripts/campaign_registry.py. Default 4, deliberately NOT matching "
+                          "bench_phase1_phase2_inmemory.py's --workers 8 convention (2026-09-11, "
+                          "real finding, not just the original DB-I/O-vs-numba-JIT compute-shape "
+                          "reasoning): a real --workers 8 run against a high-second-row-count "
+                          "ticker (SOXL, ~22M second-resolution rows) OOM-killed a worker mid-scope "
+                          "even WITH this file's own preload-before-fork fix applied, because each "
+                          "worker's per-candidate GT backtest simulation allocates real per-worker "
+                          "transient arrays scaled to that ticker's raw data length -- separate from, "
+                          "and not fixed by, the preload (which only removes STATIC input-dataframe "
+                          "duplication). Do not bump this default until that per-worker simulation "
+                          "memory-scaling issue is separately resolved.")
     ap.add_argument("--min-alpha", type=float, default=200,
                      help="Alpha floor for the 'best safe node' cliff-safety search (default 200%%, matching "
                           "top_safe_nodes.py's convention). 'best unsafe node'/'5min best possible' are always "

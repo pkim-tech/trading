@@ -43,6 +43,8 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
+## [backtest][tooling] Found 2026-09-11 — candidate_summary_report.py's --kernel gt Phase4 (`run_gt_mode`) OOMs a worker at --workers 8 on high-second-row-count tickers (SOXL, ~22M second-resolution rows), even after this session's preload-before-fork fix (which only removes static input-dataframe duplication, not the per-worker transient arrays a GT backtest simulation allocates scaled to the ticker's raw second-resolution row count). Confirmed live: baseline (no preload) OOM-killed a scope at --workers 8 on SOXL; the preload-fixed code was still climbing toward the same risk (workers at 2.4-4.6GB RSS, system down to ~3.8GB available/swap engaged) before being killed as a precaution. --workers default deliberately left at 4 pending this. Needs its own fix (likely a smaller effective worker count or memory-bounded simulation specifically for high-second-row tickers) before the --workers default can be raised project-wide.
+
 ## [backtest][testing] Deferred 2026-09-10 — pre-commit checklist's strategies.py-changed items (verify_trailing_buy/sell_resolution --tickers AGQ,SOXL, signals_invariants.py) not run before tonight's strategies.py commit
 User's explicit call to defer rather than block the commit — not run, not silently skipped/forgotten. Run before the next session touches strategies.py/live trailing state, or explicitly re-decide to skip again.
 
