@@ -1497,6 +1497,56 @@ def _run_one_gt_scope_worker(db_path, ticker, strategy, version, entry_timing, f
     return buf.getvalue(), rows, error
 
 
+GT_WORKERS_CAP_ROW_THRESHOLD = 15_000_000
+GT_WORKERS_CAPPED_VALUE = 4
+
+
+def resolve_effective_gt_workers(conn, massive_tickers, requested_workers):
+    """Row-count-keyed effective-workers cap for run_gt_mode's outer per-scope pool
+    (2026-09-11, scripts/calibrate_gt_workers.py dispatch). Real mechanism is per-worker
+    cache/state growth (_SECOND_DF_CACHE etc.) ACROSS a long-lived worker's many
+    sequential candidates, not a single call's peak memory -- confirmed via
+    calibrate_gt_workers.py's --sustained mode, which showed per-worker PSS growth over
+    15 candidates scaling with ticker row count (AGQ +0.24GB/worker, TNA +0.47GB/worker)
+    and SOXL at workers=8 genuinely exceeding safe memory under that realistic sustained
+    load (a real, non-instant trip -- distinct from a single-cell test, which showed no
+    ceiling at all for any of the three tickers). Keyed on real active-build row count
+    (not a hardcoded ticker name) so any other ticker that grows into SOXL's row-count
+    range later is covered automatically, and so AGQ/TNA-scale tickers aren't penalized
+    by a blanket low default. Threshold picked from the actual measured growth rates:
+    TNA (11.4M rows) stayed safe under sustained load, SOXL (22.2M) did not --
+    GT_WORKERS_CAP_ROW_THRESHOLD splits the two clusters.
+
+    `massive_tickers`: real tickers in this run whose scopes use data_source='massive'
+    (only those load second-resolution data at all -- a yahoo-sourced scope never hits
+    this growth path). Below the threshold, `requested_workers` is returned as-is;
+    above it, capped at GT_WORKERS_CAPPED_VALUE regardless of what was requested."""
+    if not massive_tickers:
+        return requested_workers
+    placeholders = ",".join("?" for _ in massive_tickers)
+    row_counts = dict(conn.execute(f"""
+        SELECT m.ticker, COUNT(*) FROM massive_second_derived m
+        JOIN active_builds ab ON ab.ticker = m.ticker AND ab.table_name = 'second'
+                              AND ab.build_id = m.build_id
+        WHERE m.ticker IN ({placeholders})
+        GROUP BY m.ticker
+    """, list(massive_tickers)).fetchall())
+    if not row_counts:
+        return requested_workers
+    worst_ticker = max(row_counts, key=row_counts.get)
+    worst_rows = row_counts[worst_ticker]
+    if worst_rows > GT_WORKERS_CAP_ROW_THRESHOLD and requested_workers > GT_WORKERS_CAPPED_VALUE:
+        print(f"[workers cap] {worst_ticker}: capped --workers {requested_workers} -> "
+              f"{GT_WORKERS_CAPPED_VALUE} -- active massive_second_derived row count "
+              f"{worst_rows:,} exceeds the sustained-load-safe threshold "
+              f"({GT_WORKERS_CAP_ROW_THRESHOLD:,}); per-worker cache/state growth across "
+              f"a long multi-candidate run scales with ticker row count (see "
+              f"scripts/calibrate_gt_workers.py --sustained), not just a single call's "
+              f"peak memory.")
+        return GT_WORKERS_CAPPED_VALUE
+    return requested_workers
+
+
 def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_window_filter=None,
                  version_filter=None, db_path=None, workers=4):
     """--kernel gt entry point: loops every real GT scope for `tickers`, printing
@@ -1741,7 +1791,10 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
                               f"back to minute per-cell, same as _load_node_inputs_ground_"
                               f"truth's own fallback.")
 
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        _massive_tickers = [t for t, ds in _preload_pairs if ds == "massive"]
+        effective_workers = resolve_effective_gt_workers(conn, _massive_tickers, workers)
+
+        with ProcessPoolExecutor(max_workers=effective_workers) as pool:
             campaign_registry.run_throttled(pool, _submit_scope, _indexed_scopes, budget_version,
                                              _on_scope_result)
 
@@ -1808,21 +1861,23 @@ def main():
                           "no effect on backtest_cache-sourced GT scopes either way.")
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--workers", type=int, default=4,
-                     help="ProcessPoolExecutor worker count for --kernel gt's per-scope loop "
-                          "(2026-08-31, Task #8 further follow-up -- this loop previously had "
-                          "zero parallelism at all). Actual in-flight concurrency is additionally "
-                          "gated by the resolved campaign's workers_budget, if any -- see "
-                          "scripts/campaign_registry.py. Default 4, deliberately NOT matching "
-                          "bench_phase1_phase2_inmemory.py's --workers 8 convention (2026-09-11, "
-                          "real finding, not just the original DB-I/O-vs-numba-JIT compute-shape "
-                          "reasoning): a real --workers 8 run against a high-second-row-count "
-                          "ticker (SOXL, ~22M second-resolution rows) OOM-killed a worker mid-scope "
-                          "even WITH this file's own preload-before-fork fix applied, because each "
-                          "worker's per-candidate GT backtest simulation allocates real per-worker "
-                          "transient arrays scaled to that ticker's raw data length -- separate from, "
-                          "and not fixed by, the preload (which only removes STATIC input-dataframe "
-                          "duplication). Do not bump this default until that per-worker simulation "
-                          "memory-scaling issue is separately resolved.")
+                     help="Requested ProcessPoolExecutor worker count for --kernel gt's "
+                          "per-scope loop (2026-08-31, Task #8 further follow-up -- this loop "
+                          "previously had zero parallelism at all). Actual in-flight concurrency "
+                          "is additionally gated by the resolved campaign's workers_budget, if "
+                          "any -- see scripts/campaign_registry.py. Automatically CAPPED at 4 "
+                          "(regardless of this flag) for any ticker whose real active-build "
+                          "massive_second_derived row count exceeds 15M (logged when this fires) "
+                          "-- calibrate_gt_workers.py's --sustained mode (2026-09-11) found "
+                          "per-worker cache/state growth ACROSS a long-lived worker's many "
+                          "sequential candidates scales with ticker row count (not a single "
+                          "call's peak memory, which showed no ceiling for any tested ticker), "
+                          "and a real SOXL (~22M rows) sustained-load run genuinely exceeded "
+                          "safe memory at workers=8 -- distinct from, and a better fit for the "
+                          "real incident than, the original single-cell/per-worker-array-size "
+                          "theory. AGQ/TNA-scale tickers are unaffected by the cap and use this "
+                          "value as-is; default 4 here is unrelated to the cap and can be raised "
+                          "for those tickers independently.")
     ap.add_argument("--min-alpha", type=float, default=200,
                      help="Alpha floor for the 'best safe node' cliff-safety search (default 200%%, matching "
                           "top_safe_nodes.py's convention). 'best unsafe node'/'5min best possible' are always "
