@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Resolved-as-decided-wont-fix 2026-09-11 — automated-buy retry-after-outage mechanism (trading_incidents #10/#11) closed per user's call: a missed entry is already covered by existing Monte Carlo missed-trade failure-mode simulation; not worth the duplicate-order-placement risk of blind retry against an ambiguous (fill-or-no-fill) outage-timeout outcome. Full detail: `deep_backlog.md`.
+
+## [live-trading][coverage] Resolved-as-already-done 2026-09-11 — `fake_broker.force_network_error_next_order()` backlog entry was stale, work already shipped `5aeeea5` (2026-09-01). Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Investigated-didn't-pan-out 2026-09-11 — concurrent multi-group dispatch for Phase4's addon-cliff-safety check: predicted ~4x, real measurement showed it's SLOWER (8.3s→10.3s) due to per-executor overhead multiplying with pool count; not committed, existing 1.75-1.8x fix stands. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-09-11 — Phase4's addon-cliff-safety check parallelized (`5b74587`), restoring parallelism lost when Phase5 got folded in 2026-09-08; ~1.75-1.8x speedup (25.4s→14.5s, 27 real candidates), zero mismatches. Paired review found+fixed 3 real bugs (coordinate-key mismatch, missed 2nd nested-pool site, wrong-consumer force-serialization) + reverted a wrong-kernel numba warmup regression. Full detail: `deep_backlog.md`.
