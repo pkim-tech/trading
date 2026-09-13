@@ -76,12 +76,14 @@ If --tickers is omitted, discovers every ticker with a candidate_nodes row for -
 import argparse
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import phase_timing
 from candidate_full_review import (
     DB_PATH, DEFAULT_VOL_GATE, FIELDNAMES, COLUMN_DEFS, ensure_candidate_nodes_table,
     gt_full_review_rows, _build_output_row, GT_SKIP_COLUMNS, GT_SKIP_LABEL, _git_provenance_stamp,
@@ -1309,6 +1311,7 @@ def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE
         raise SystemExit(f"No candidate_nodes rows for version={version!r}")
     print(f"Tickers ({len(all_tickers)}): {all_tickers}")
 
+    _t0 = time.time()
     print(f"\n--- Building Tab 2: Candidates (curated top-{top_n}-per-category) ---")
     cand_rows_raw = cri.fetch_rows(conn, version)
     if not cand_rows_raw:
@@ -1322,6 +1325,8 @@ def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE
         wanted = set(all_tickers)
         curated_rows = [r for r in curated_rows if r["ticker"] in wanted]
     print(f"Curated: {len(curated_rows)} rows across {len(set(r['ticker'] for r in curated_rows))} tickers")
+    _t1 = time.time()
+    phase_timing.record_phase_timing("Phase9-Tab2", "ALL", "n/a", "n/a", _t1 - _t0, version)
 
     if full_review_population == "core_safe":
         print(f"\n--- Building Tab 1: Full Review (scoped to the real core_safe=True "
@@ -1338,6 +1343,8 @@ def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE
         tab1_population = curated_rows
     full_review_rows = _full_review_rows_for_curated(tab1_population, version, vol_gate, db_path,
                                                        max_workers=workers)
+    _t2 = time.time()
+    phase_timing.record_phase_timing("Phase10-Tab1", "ALL", "n/a", "n/a", _t2 - _t1, version)
 
     print("\n--- Building Tab 3: All Candidates (raw) ---")
     raw_rows = _raw_population_rows(conn, version)
@@ -1345,6 +1352,8 @@ def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE
         wanted = set(all_tickers)
         raw_rows = [r for r in raw_rows if r["ticker"] in wanted]
     print(f"Raw population: {len(raw_rows)} rows")
+    _t3 = time.time()
+    phase_timing.record_phase_timing("Phase10-Tab3", "ALL", "n/a", "n/a", _t3 - _t2, version)
 
     return full_review_rows, curated_rows, raw_rows
 

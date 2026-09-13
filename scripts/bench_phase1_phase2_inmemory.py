@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import pandas as pd
 from tqdm import tqdm
 
+import phase_timing
 from run_optimization_sweep import (
     compute_bh_returns, window_version_suffix, run_single_backtest_node_ground_truth_isolated,
     _trail_pcts_for_strategy, pick_island_centers, FINE_RADIUS, N_ISLANDS,
@@ -2415,6 +2416,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
           print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase1 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
                 f"{len(phase1_rows):,} rows in {t1 - t0:.1f}s "
                 f"({len(phase1_rows) / max(t1 - t0, 0.001):.0f} nodes/sec)")
+          phase_timing.record_phase_timing("Phase1", TICKER, strategy_name, fixed_sl, t1 - t0, version)
 
           # Guard BEFORE building df1 (2026-08-29, paired review): if every Phase1 cell
           # failed (non-SUCCESS status), phase1_rows is [] and pd.DataFrame([]) has no
@@ -2597,6 +2599,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
             f"{len(phase2_rows):,} rows across {N_GENERATIONS} generation(s) in {t3 - t2:.1f}s "
             f"({len(phase2_rows) / max(t3 - t2, 0.001):.0f} nodes/sec)")
+      phase_timing.record_phase_timing("Phase2", TICKER, strategy_name, fixed_sl, t3 - t2, version)
 
       # Phase2 insurance snapshot (2026-09-03): same "write-once debug aid" posture as
       # the Phase1 insurance snapshot above, applied one phase later -- persists
@@ -2951,6 +2954,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2.5 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
           f"{len(phase25_rows):,} rows in {t5 - t4:.1f}s "
           f"({len(phase25_rows) / max(t5 - t4, 0.001):.0f} nodes/sec)")
+    phase_timing.record_phase_timing("Phase2.5", TICKER, strategy_name, fixed_sl, t5 - t4, version)
 
     print(f"\nTotal: Phase1={t1 - t0:.1f}s + Phase2={t3 - t2:.1f}s + Phase2.5={t5 - t4:.1f}s "
           f"= {t5 - t0:.1f}s wall-clock, zero DB writes "

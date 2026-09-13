@@ -43,6 +43,7 @@ import re
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -50,6 +51,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import phase_timing
 from top_safe_nodes import CLIFF_RADIUS, best_safe_node
 from annualized_alpha_report import calendar_days, cagr
 from locate_best_node import resolve_version
@@ -1623,6 +1625,15 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
         _indexed_scopes = list(enumerate(scopes))
         _pending = {}
         _next_to_emit = [0]
+        # Phase timing (2026-09-13): scopes for multiple tickers share one pool, so
+        # there's no clean per-ticker start boundary -- _phase4_start is the whole
+        # pool's start, and _ticker_last_done tracks the real wall-clock moment each
+        # ticker's LAST scope actually completed (via _on_scope_result, not emit
+        # order). elapsed = last_done - _phase4_start therefore overstates a ticker
+        # that finishes early while others are still running concurrently; accepted
+        # as the honest cost of a shared pool rather than a per-ticker illusion.
+        _phase4_start = time.time()
+        _ticker_last_done = {}
 
         def _scope_banner(scope):
             # Uses the SAME _gt_scope_banner_text function _run_one_gt_scope_worker's
@@ -1646,6 +1657,7 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
 
         def _on_scope_result(indexed_scope, result_or_exc):
             idx, scope = indexed_scope
+            _ticker_last_done[scope[0]] = time.time()
             if isinstance(result_or_exc, Exception):
                 # An exception here means something OUTSIDE _run_one_gt_scope_worker's own
                 # try/except failed (e.g. the task itself couldn't be pickled/unpickled) --
@@ -1775,9 +1787,18 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
     # Phase1-2.5, across a long unattended multi-ticker queue run.
     for ticker in tickers:
         n_rows = sum(1 for r in all_rows if r.get("ticker") == ticker)
-        n_scopes = sum(1 for s in scopes if s[0] == ticker)
+        ticker_scopes = [s for s in scopes if s[0] == ticker]
+        n_scopes = len(ticker_scopes)
         print(f"PROGRESS: Phase4 done ticker={ticker}: {n_rows} candidate rows "
               f"across {n_scopes} scope(s)")
+        if ticker_scopes and ticker in _ticker_last_done:
+            _strategies = {s[1] for s in ticker_scopes}
+            _fixed_sls = {s[4] for s in ticker_scopes}
+            _strategy = _strategies.pop() if len(_strategies) == 1 else "multi"
+            _fixed_sl = _fixed_sls.pop() if len(_fixed_sls) == 1 else "multi"
+            phase_timing.record_phase_timing(
+                "Phase4", ticker, _strategy, _fixed_sl,
+                _ticker_last_done[ticker] - _phase4_start, budget_version)
 
 
 def main():
