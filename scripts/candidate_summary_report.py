@@ -1755,7 +1755,7 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
                               f"truth's own fallback.")
 
         _massive_tickers = [t for t, ds in _preload_pairs if ds == "massive"]
-        effective_workers = db_cache.resolve_effective_gt_workers(_massive_tickers, workers, conn=conn)
+        effective_workers = db_cache.resolve_effective_gt_workers(_massive_tickers, workers)
 
         with ProcessPoolExecutor(max_workers=effective_workers) as pool:
             campaign_registry.run_throttled(pool, _submit_scope, _indexed_scopes, budget_version,

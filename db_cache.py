@@ -1343,7 +1343,7 @@ def resolve_effective_gt_workers(massive_tickers, requested_workers, conn=None):
         return requested_workers
     owns = conn is None
     try:
-        c = conn if conn is not None else sqlite3.connect(DB_PATH, timeout=60.0)
+        c = conn if conn is not None else sqlite3.connect(TICKDATA_DB_PATH, timeout=60.0)
         try:
             placeholders = ",".join("?" for _ in massive_tickers)
             row_counts = dict(c.execute(f"""
