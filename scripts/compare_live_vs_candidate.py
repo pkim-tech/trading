@@ -43,7 +43,19 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import sqlite3  # noqa: E402
 from run_optimization_sweep import DB_PATH  # noqa: E402
-from live_db import get_conn as get_live_conn  # noqa: E402
+import signals_config  # noqa: E402
+
+
+def get_live_conn():
+    """Real live watch_list connection (cache/live/trading_live.db) -- this script's
+    original `from live_db import get_conn` never resolved (no such module; signals_db.py
+    has the real live-DB connection helper, but as a private _conn(), not a public API
+    this script should reach into) -- confirmed broken (ModuleNotFoundError) 2026-09-13,
+    never actually run since being written 2026-09-08 (see scripts/list_scripts.py's own
+    usage log, which had this at 'never logged')."""
+    c = sqlite3.connect(signals_config.DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
 DIMS = [
     ("core", "cagr_pct", "core_cagr_1s"),
