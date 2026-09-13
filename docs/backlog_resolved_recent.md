@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-09-13 — `candidate_full_review_two_tab.py --workers` now routed through `resolve_effective_gt_workers` (real SOXL OOM crash confirmed via dmesg); also fixed a second, more serious bug found along the way — tonight's `tickdata.db` split had silently broken this cap's default connection, meaning `run_gt_mode`'s/`bench_phase1_phase2_inmemory.py`'s existing SOXL protection was non-functional since the split landed. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-13 — persist per-phase sweep timing via new `phase_timing.py` (modeled on `script_usage.py`), wired into Phase1/2/2.5/4/9/10 + `scripts/phase_timing_report.py` reader; gated-file diff paired-reviewed, no HIGH/CRITICAL. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling][HIGH] Resolved 2026-09-13 — `ATTACH_CAMPAIGN_ID` version-mismatch guard wired into `resolve_campaign()`: closes both 2026-09-12 real incidents (CAMPAIGN_LABEL and WINDOW_START/END omission), verified against real campaign_18/22 data. Full detail: `deep_backlog.md`.

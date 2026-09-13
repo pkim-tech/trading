@@ -43,9 +43,6 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [backtest][tooling] Found 2026-09-13 — `candidate_full_review_two_tab.py --workers N` has an uncapped pool, real OOM crash on SOXL at `--workers 8`
-Same defect class as the `run_addon_cliff_safety_ground_truth` item above (not routed through `db_cache.resolve_effective_gt_workers`) — confirmed via a real kernel OOM-kill tonight. Full detail: `deep_backlog.md`.
-
 ## [backtest][tooling] Found 2026-09-13 — `top_safe_nodes.py`'s absolute `robust_alpha` floor unfairly penalizes short-history tickers (ETHU); user wants a CAGR floor instead, existing partial fix looks unwired
 Not urgent — today's real Phase 9/10 reports don't use this path. Full detail: `deep_backlog.md`.
 
