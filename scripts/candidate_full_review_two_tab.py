@@ -83,6 +83,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import db_cache
 import phase_timing
 from candidate_full_review import (
     DB_PATH, DEFAULT_VOL_GATE, FIELDNAMES, COLUMN_DEFS, ensure_candidate_nodes_table,
@@ -1341,8 +1342,15 @@ def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE
         print("\n--- Building Tab 1: Full Review (scoped to Tab 2's curated node_ids -- see "
               "module docstring for why) ---")
         tab1_population = curated_rows
+    # Row-count-keyed workers cap (2026-09-13, real OOM crash on SOXL at --workers 8):
+    # this pool resimulates real GT candidates, same growth risk db_cache.
+    # resolve_effective_gt_workers already caps for run_gt_mode/bench_phase1_phase2_
+    # inmemory.py's Phase2.5 pool -- this call site was the one gap, never routed
+    # through it. Scoped to the tickers actually in THIS run (all_tickers), not the
+    # whole real-live ticker universe.
+    effective_workers = db_cache.resolve_effective_gt_workers(all_tickers, workers)
     full_review_rows = _full_review_rows_for_curated(tab1_population, version, vol_gate, db_path,
-                                                       max_workers=workers)
+                                                       max_workers=effective_workers)
     _t2 = time.time()
     phase_timing.record_phase_timing("Phase10-Tab1", "ALL", "n/a", "n/a", _t2 - _t1, version)
 
