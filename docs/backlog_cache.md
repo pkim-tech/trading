@@ -46,6 +46,9 @@
 ## [backtest][tooling] Found 2026-09-13 — `top_safe_nodes.py`'s absolute `robust_alpha` floor unfairly penalizes short-history tickers (ETHU); user wants a CAGR floor instead, existing partial fix looks unwired
 Not urgent — today's real Phase 9/10 reports don't use this path. Full detail: `deep_backlog.md`.
 
+## [backtest][tooling] Raised 2026-09-13 — rename `candidate_nodes.robust_alpha`/`robust_alpha_computed_at` (44 consuming files, incl. gated kernel modules)
+No longer a true 3-way MIN for GT rows, just `alpha_vs_spy` under an old name. Real scope, not urgent. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Raised 2026-09-12 — evaluate migrating tick data (`massive_*_derived`) from SQLite to Parquet/DuckDB for real compression+scan-speed gains
 Raised while discussing tonight's `tickdata.db` SQLite-to-SQLite split: Parquet/columnar storage would likely beat SQLite on both size and range-scan speed for this read-mostly analytical workload, but it's a materially bigger project than the split — not just repointing reads. The multi-vintage build/versioning system (`active_builds`, `massive_*_derived_builds`, `promote_derived_build.py`'s refuse-to-narrow guard, `reinject_derived_build.py`'s raw INSERT/rebuild logic) is built entirely around mutable-row SQL semantics and would need redesigning around immutable partitioned files, plus a full bit-identical-output verification pass across every consumer before trusting it for backtest kernel input. Decided 2026-09-12: do the plain SQLite split now, scope this as its own project later (comparable scope to `docs/plans/backtest_schema_v2_phase_tables.md`). Not scoped, not started.
 
