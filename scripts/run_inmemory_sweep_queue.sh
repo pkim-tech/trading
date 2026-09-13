@@ -267,6 +267,46 @@ resolve_campaign() {
       echo "$status_out"
       exit 1
     fi
+    # Version-mismatch guard (2026-09-13, closes the two real 2026-09-12 incidents
+    # documented in backlog_cache.md: ATTACH_CAMPAIGN_ID set without CAMPAIGN_LABEL,
+    # and without WINDOW_START/WINDOW_END, each silently computed a DIFFERENT real
+    # campaign's version and false-skipped real work). Compute what THIS script's
+    # own current env vars would produce as a version string -- the SAME logic
+    # each per-job bench_phase1_phase2_inmemory.py invocation below actually uses --
+    # via compute_expected_bench_version.py, and fail loudly on any mismatch instead
+    # of silently proceeding under the wrong version.
+    local EXPECTED_WINDOW_ARGS=()
+    if [ -n "${WINDOW_START:-}" ]; then
+      EXPECTED_WINDOW_ARGS=(--window-start "$WINDOW_START" --window-end "$WINDOW_END")
+    fi
+    local EXPECTED_ENTRY_TIMING_ARGS=()
+    if [ -n "$ENTRY_TIMING" ]; then
+      EXPECTED_ENTRY_TIMING_ARGS=(--entry-timing "$ENTRY_TIMING")
+    fi
+    local EXPECTED_CAMPAIGN_LABEL_ARGS=()
+    if [ -n "$CAMPAIGN_LABEL" ]; then
+      EXPECTED_CAMPAIGN_LABEL_ARGS=(--campaign-label "$CAMPAIGN_LABEL")
+    fi
+    local expected_version
+    if ! expected_version=$($PYTHON scripts/compute_expected_bench_version.py \
+        --z-thresholds "$Z_THRESHOLDS" --n-islands "$N_ISLANDS" \
+        "${EXPECTED_CAMPAIGN_LABEL_ARGS[@]}" \
+        "${EXPECTED_WINDOW_ARGS[@]}" \
+        "${EXPECTED_ENTRY_TIMING_ARGS[@]}"); then
+      echo "FATAL: compute_expected_bench_version.py failed -- aborting:"
+      echo "$expected_version"
+      exit 1
+    fi
+    if [ "$expected_version" != "$VERSION" ]; then
+      echo "FATAL: version mismatch for ATTACH_CAMPAIGN_ID=$ATTACH_CAMPAIGN_ID."
+      echo "  This script's current env (Z_THRESHOLDS/N_ISLANDS/CAMPAIGN_LABEL/WINDOW_START/WINDOW_END/ENTRY_TIMING) would compute:"
+      echo "    $expected_version"
+      echo "  but campaign_id=$ATTACH_CAMPAIGN_ID's real registered version is:"
+      echo "    $VERSION"
+      echo "  Set the missing/mismatched env var(s) to match that campaign's actual config" \
+           "(see: $PYTHON scripts/campaign_registry.py status --campaign-id $ATTACH_CAMPAIGN_ID) before retrying."
+      exit 1
+    fi
     CAMPAIGN_ID="$ATTACH_CAMPAIGN_ID"
     echo "Attached to existing campaign_id=$CAMPAIGN_ID, version=$VERSION (not creating a new campaign row)"
     return

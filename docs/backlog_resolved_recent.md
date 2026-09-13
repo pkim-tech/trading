@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling][HIGH] Resolved 2026-09-13 — `ATTACH_CAMPAIGN_ID` version-mismatch guard wired into `resolve_campaign()`: closes both 2026-09-12 real incidents (CAMPAIGN_LABEL and WINDOW_START/END omission), verified against real campaign_18/22 data. Full detail: `deep_backlog.md`.
+
 ## [tooling][data] Resolved 2026-09-13 — split `massive_*_derived` tick-data tables (+`massive_hourly_corrections`/`active_builds`) out of `trading_universe.db` into new `tickdata.db`: 42.3GB→14.6GB, verified row-count+checksum match, all consumers repointed (wider raw-SQL surface than originally scoped), `signals_invariants.py` change paired-reviewed (no HIGH/CRITICAL). Full detail: `deep_backlog.md`.
 
 ## [live-trading][coverage] Resolved 2026-09-12 (found stale during backlog review) — CURE/TMF/ERX `SCHWAB_AUTOMATION_TICKERS` gap: fix was already applied 2026-08-16 and ERX itself already entered/exited/archived 2026-08-27; backlog entry never closed out. New small follow-up filed separately: TMF has an unrelated unactioned `pending_buys` row from 2026-09-09. Full detail: `deep_backlog.md`.
