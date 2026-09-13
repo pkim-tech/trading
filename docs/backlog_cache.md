@@ -43,7 +43,7 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [backtest][tooling] Found 2026-09-13 — Phase4/Phase5 consolidation never ported trade-level persistence; user wants it captured at promotion time instead, not for the full sweep population
+## [backtest][tooling] Found 2026-09-13 — Phase4/Phase5 consolidation never ported trade-level persistence; add a store step to the curated-population trade list Phase 9/10 already computes
 Confirmed: `phase5_trades`'s highest-ever `candidate_id` is 49546 -- nothing from v6.5.2+ has trade-level data, even though `phase4_results` has real CAGR numbers for those same candidates. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Found 2026-09-13 — `top_safe_nodes.py`'s absolute `robust_alpha` floor unfairly penalizes short-history tickers (ETHU); user wants a CAGR floor instead, existing partial fix looks unwired
