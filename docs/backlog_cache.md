@@ -43,6 +43,9 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
+## [backtest][tooling] Raised 2026-09-12 — evaluate migrating tick data (`massive_*_derived`) from SQLite to Parquet/DuckDB for real compression+scan-speed gains
+Raised while discussing tonight's `tickdata.db` SQLite-to-SQLite split: Parquet/columnar storage would likely beat SQLite on both size and range-scan speed for this read-mostly analytical workload, but it's a materially bigger project than the split — not just repointing reads. The multi-vintage build/versioning system (`active_builds`, `massive_*_derived_builds`, `promote_derived_build.py`'s refuse-to-narrow guard, `reinject_derived_build.py`'s raw INSERT/rebuild logic) is built entirely around mutable-row SQL semantics and would need redesigning around immutable partitioned files, plus a full bit-identical-output verification pass across every consumer before trusting it for backtest kernel input. Decided 2026-09-12: do the plain SQLite split now, scope this as its own project later (comparable scope to `docs/plans/backtest_schema_v2_phase_tables.md`). Not scoped, not started.
+
 ## [backtest][tooling][HIGH][specced] Found 2026-09-12 — `ATTACH_CAMPAIGN_ID` with mismatched/omitted `WINDOW_START`/`WINDOW_END` silently computes a DIFFERENT campaign's version, same failure shape as the CAMPAIGN_LABEL entry below
 Real live incident (campaign_22 launch, SOXL version-collision, ~90s of zero real work). Fix decided + helper built (`scripts/compute_expected_bench_version.py`, 6 tests), not yet wired into `run_inmemory_sweep_queue.sh` (was actively running at the time). Full detail: `deep_backlog.md`.
 
