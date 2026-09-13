@@ -1,5 +1,12 @@
 # Backlog
 
+## [backtest][tooling] Found 2026-09-13 — `candidate_full_review_two_tab.py --workers N` has an uncapped worker pool, real OOM crash on SOXL confirmed
+Real incident: launched `candidate_full_review_two_tab.py --version v6.5.2-...-w2021-08-23_2026-08-21-... --full-review-population core_safe --workers 8` (8,693-row core_safe population, 739 scope-groups) to rebuild the v6.5.2 report with the wider `core_safe` scope (matching the v6.5.1-era `candidate_full_review_v6.5.1_full_core_safe.xlsx` shape the user was expecting). Crashed at scope-group 33/739 (SOXL/TrailingBothZScoreBreakout/fixed_sl=8.0/window=20) with `concurrent.futures.process.BrokenProcessPool`. Confirmed via kernel log (`dmesg`): a real OOM-kill (`pid=25529`, `anon-rss:4825288kB` ≈ 4.8GB) killed the worker outright. No output file was produced (crash occurred before any write).
+
+Same defect class as the already-backlogged `run_addon_cliff_safety_ground_truth` item (`docs/backlog_cache.md`, raised 2026-09-11): this script's `--workers` flag creates its own `ProcessPoolExecutor` directly, never routed through `db_cache.resolve_effective_gt_workers` (the row-count-threshold-keyed cap built the same night specifically for SOXL-scale tickers, currently only wired into `run_gt_mode`'s second-resolution pool). SOXL's real `massive_second_derived` row count (~22.2M) exceeds the calibrated-unsafe-under-sustained-load threshold this cap exists to catch.
+
+**Not fixed tonight** — worked around by relaunching with `--workers 3` instead (real, immediate fix: lower parallelism); still running as of this entry, not yet confirmed complete. Real fix, not yet built: thread `db_cache.resolve_effective_gt_workers(tickers, workers)` into this script's pool-creation call the same way `run_gt_mode` already does, so a caller doesn't have to manually know to lower `--workers` for SOXL-scale tickers.
+
 ## ✅ [backtest][tooling] Resolved 2026-09-13 — persist per-phase sweep timing (Phase1/Phase2/Phase2.5, Phase4, Phase9/Phase10) via a new `phase_timing.py`, modeled on `script_usage.py`
 Found while trying to answer "how long would running the full checklist on all 13,101 raw candidates take" for `candidate_full_review_two_tab.py` — had to guess from a stale docstring estimate (11-13s/candidate, 2026-09-01) instead of querying a real number, because Phase4/Phase9/Phase10 have zero persisted timing (only an ephemeral `PROGRESS:` print in `candidate_summary_report.py`, nothing written to a table).
 
