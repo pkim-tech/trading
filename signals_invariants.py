@@ -273,7 +273,7 @@ def check_massive_hourly_derived_freshness():
     violations = []
     today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
     last_bday = _last_completed_trading_day(today)
-    with sqlite3.connect(db_cache.DB_PATH) as conn:
+    with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
         for node in db.get_watchlist():
             if not helpers.has_capital_at_stake(node):
                 continue
@@ -321,7 +321,7 @@ def check_massive_minute_derived_freshness():
     violations = []
     today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
     last_bday = _last_completed_trading_day(today)
-    with sqlite3.connect(db_cache.DB_PATH) as conn:
+    with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
         for node in db.get_watchlist():
             if not helpers.has_capital_at_stake(node):
                 continue

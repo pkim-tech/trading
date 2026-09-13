@@ -156,7 +156,7 @@ def build_ticker(ticker):
         session = apply_dividend_adjustment(session, residual_divs)
     dividend_asof = max((d["ex_dividend_date"] for d in divs), default=None)
 
-    with sqlite3.connect(db_cache.DB_PATH) as conn:
+    with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
         build_id = db_cache.record_massive_second_build(
             ticker, BUILD_LABEL, raw_pulled_at, raw_data_start, raw_data_end,
             dividend_asof, len(session), correction_count=0, conn=conn)

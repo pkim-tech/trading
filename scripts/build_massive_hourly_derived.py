@@ -369,7 +369,7 @@ def build_ticker(ticker):
     # vintages with zero error). Wrapping every write for this build in one
     # sqlite3 transaction means a failure at any point rolls back the whole build --
     # the next rerun starts clean rather than leaving a mismatched pair on file.
-    with sqlite3.connect(db_cache.DB_PATH) as conn:
+    with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
         build_id = db_cache.record_massive_hourly_build(
             ticker, BUILD_LABEL, raw_pulled_at, raw_data_start, raw_data_end,
             dividend_asof, len(hourly_corrected), len(corrections), conn=conn)

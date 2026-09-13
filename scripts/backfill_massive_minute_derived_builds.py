@@ -41,7 +41,7 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help="report what would be written, without writing")
     args = ap.parse_args()
 
-    with sqlite3.connect(db_cache.DB_PATH) as conn:
+    with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         db_cache._ensure_massive_minute_derived_builds_table(conn)
         pairs = conn.execute(

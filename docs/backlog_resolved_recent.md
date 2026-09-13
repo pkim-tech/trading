@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [tooling][data] Resolved 2026-09-13 — split `massive_*_derived` tick-data tables (+`massive_hourly_corrections`/`active_builds`) out of `trading_universe.db` into new `tickdata.db`: 42.3GB→14.6GB, verified row-count+checksum match, all consumers repointed (wider raw-SQL surface than originally scoped), `signals_invariants.py` change paired-reviewed (no HIGH/CRITICAL). Full detail: `deep_backlog.md`.
+
 ## [live-trading][coverage] Resolved 2026-09-12 (found stale during backlog review) — CURE/TMF/ERX `SCHWAB_AUTOMATION_TICKERS` gap: fix was already applied 2026-08-16 and ERX itself already entered/exited/archived 2026-08-27; backlog entry never closed out. New small follow-up filed separately: TMF has an unrelated unactioned `pending_buys` row from 2026-09-09. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved-as-already-done 2026-09-12 (found stale during backlog review) — persist full-review-report data to a queryable DB table: already built as `candidate_full_review_snapshots` (202,908 rows, `node_id`/`source_file`/`sheet_name`/`captured_at`/`row_json`), wired via `_persist_snapshot()` inside Phase 9 (`candidate_full_review_two_tab.py:1289`) since the 2026-09-10 Phase 9 build; backlog entry just never got closed out. Full detail: `deep_backlog.md`.

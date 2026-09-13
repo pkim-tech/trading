@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    with sqlite3.connect(db_cache.DB_PATH) as conn:
+    with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         meta = conn.execute(
             "SELECT * FROM massive_hourly_derived_builds WHERE ticker=? AND id=?",

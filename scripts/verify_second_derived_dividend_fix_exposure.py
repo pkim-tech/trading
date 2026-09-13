@@ -40,22 +40,23 @@ import pandas as pd
 import db_cache
 
 DB_PATH = "cache/research/trading_universe.db"
+TICKDATA_DB_PATH = "cache/research/tickdata.db"
 FIX_CUTOFF = "2026-09-06T18:44:14"
 TICKERS = ["SOXL", "AGQ", "ETHU", "OILU", "GDXU", "UGL", "WEBL", "DFEN",
            "HIBL", "JNUG", "KORU", "LABU", "NUGT", "DPST"]
 
 
-def dividend_row_count(conn, ticker):
-    return conn.execute(
+def dividend_row_count(tick_conn, ticker):
+    return tick_conn.execute(
         "SELECT COUNT(*) FROM massive_dividends_raw WHERE ticker=?", (ticker,)
     ).fetchone()[0]
 
 
-def pre_and_active_build_ids(conn, ticker):
-    pre = conn.execute(
+def pre_and_active_build_ids(tick_conn, ticker):
+    pre = tick_conn.execute(
         "SELECT MIN(id) FROM massive_second_derived_builds WHERE ticker=?", (ticker,)
     ).fetchone()[0]
-    active = conn.execute(
+    active = tick_conn.execute(
         "SELECT build_id FROM active_builds WHERE ticker=? AND table_name='second'", (ticker,)
     ).fetchone()
     active = active[0] if active else None
@@ -89,16 +90,17 @@ def compare_builds(ticker, pre_build, active_build):
 
 def main():
     conn = sqlite3.connect(DB_PATH)
+    tick_conn = sqlite3.connect(TICKDATA_DB_PATH)
     print(f"{'ticker':6s} {'div_rows':>9s} {'exposed':>8s}  detail")
     print("-" * 90)
     exposed_report = []
     for t in TICKERS:
-        divs = dividend_row_count(conn, t)
+        divs = dividend_row_count(tick_conn, t)
         if divs == 0:
             print(f"{t:6s} {divs:9d} {'no':>8s}  no dividend records -- can't be affected")
             continue
 
-        pre_build, active_build = pre_and_active_build_ids(conn, t)
+        pre_build, active_build = pre_and_active_build_ids(tick_conn, t)
         if pre_build is None or active_build is None:
             print(f"{t:6s} {divs:9d} {'?':>8s}  missing build_id (pre={pre_build}, active={active_build})")
             continue

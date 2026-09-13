@@ -19,8 +19,11 @@ import scripts.promote_derived_build as promote_mod
 
 @pytest.fixture
 def isolated_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(db_cache, "DB_PATH", str(tmp_path / "test_universe.db"))
-    return db_cache.DB_PATH
+    # massive_*/active_builds now live in TICKDATA_DB_PATH, not DB_PATH (2026-09-12
+    # tickdata.db split) -- this fixture's tables are all in that family, so it's
+    # TICKDATA_DB_PATH that needs isolating.
+    monkeypatch.setattr(db_cache, "TICKDATA_DB_PATH", str(tmp_path / "test_tickdata.db"))
+    return db_cache.TICKDATA_DB_PATH
 
 
 def _hourly_df(start, n, freq="h"):

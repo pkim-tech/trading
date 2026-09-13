@@ -209,14 +209,14 @@ def main():
         if args.ticker or args.table:
             print("--migrate is standalone -- don't combine with --ticker/--table.", file=sys.stderr)
             return 1
-        with sqlite3.connect(db_cache.DB_PATH) as conn:
+        with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
             return cmd_migrate(conn)
 
     if not args.ticker or not args.table:
         print("Either --migrate, or both --ticker and --table are required.", file=sys.stderr)
         return 1
 
-    with sqlite3.connect(db_cache.DB_PATH) as conn:
+    with sqlite3.connect(db_cache.TICKDATA_DB_PATH) as conn:
         return cmd_promote(conn, args)
 
 

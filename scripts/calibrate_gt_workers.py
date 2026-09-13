@@ -55,6 +55,7 @@ import psutil
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 DB_PATH = _ROOT / "cache" / "research" / "trading_universe.db"
+TICKDATA_DB_PATH = _ROOT / "cache" / "research" / "tickdata.db"
 RESULTS_PATH = _ROOT / "output" / "calibrate_gt_workers_results.json"
 
 # Fraction of total system memory left as headroom -- this is a shared dev machine.
@@ -81,7 +82,7 @@ CANDIDATES = {
 
 
 def real_active_row_count(ticker):
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(TICKDATA_DB_PATH))
     try:
         cur = conn.execute("""
             SELECT COUNT(*) FROM massive_second_derived m

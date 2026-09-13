@@ -4,6 +4,12 @@ import pandas as pd
 from pathlib import Path
 
 DB_PATH = str(Path(__file__).parent / "cache" / "research" / "trading_universe.db")
+# tickdata.db: massive_* tick-data tables (hourly/minute/second derived + builds +
+# dividends_raw) plus active_builds (their promotion pointer) -- split out
+# 2026-09-12, see docs/deep_backlog.md, since it's the bulk of trading_universe.db's
+# size and has an entirely separate write pattern (bulk rebuild, not incremental
+# trade/signal rows).
+TICKDATA_DB_PATH = str(Path(__file__).parent / "cache" / "research" / "tickdata.db")
 
 
 def _ensure_table(conn):
@@ -412,7 +418,7 @@ def cache_massive_dividends(ticker, records):
     """records: list of dicts from the Massive dividends API response (raw
     'results' array). Upserts by (ticker, ex_dividend_date) -- a rerun for the
     same ticker just refreshes factors rather than duplicating rows."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(TICKDATA_DB_PATH) as conn:
         _ensure_massive_dividends_table(conn)
         for r in records:
             conn.execute("""
@@ -426,7 +432,7 @@ def cache_massive_dividends(ticker, records):
 
 
 def get_massive_dividends(ticker):
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(TICKDATA_DB_PATH) as conn:
         _ensure_massive_dividends_table(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -544,7 +550,7 @@ def _connect_or_reuse(conn):
     vintages with no error), the caller manages commit/rollback itself."""
     if conn is not None:
         return conn, False
-    return sqlite3.connect(DB_PATH), True
+    return sqlite3.connect(TICKDATA_DB_PATH), True
 
 
 def write_massive_hourly_derived(ticker, build_id, df, conn=None):
@@ -629,7 +635,7 @@ def _migrate_active_builds_table_widen_check(conn):
     SQL for the widened CHECK before doing anything, so re-running this (or calling
     it twice in the same process) is a no-op the second time. The RENAME/CREATE/
     INSERT/verify/DROP sequence below runs inside the caller's own transaction --
-    every caller reaches this via `with sqlite3.connect(DB_PATH) as conn:` (commits
+    every caller reaches this via `_connect_or_reuse` against TICKDATA_DB_PATH (commits
     only if the whole block succeeds, rolls back on any exception), so a failure at
     any point (including the explicit row-count check) leaves the original table
     completely untouched under its original name."""
@@ -772,7 +778,7 @@ def promote_active_build(ticker, table_name, build_id, note=None, conn=None):
 
 
 def get_latest_massive_hourly_build(ticker):
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(TICKDATA_DB_PATH) as conn:
         _ensure_massive_hourly_derived_table(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -798,7 +804,7 @@ def get_massive_hourly_derived(ticker, build_id=None):
     active_builds table's own docstring) -- replaced with an explicit promotion
     pointer instead. No orphan-skip logic needed here anymore: promotion only ever
     points at a build scripts/promote_derived_build.py already confirmed has rows."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(TICKDATA_DB_PATH) as conn:
         _ensure_massive_hourly_derived_table(conn)
         import pandas as pd
         if build_id is None:
@@ -952,7 +958,7 @@ def get_massive_second_derived(ticker, build_id=None):
     Reads via chunksize instead (same pattern as scripts/build_massive_second_derived.py's
     2026-09-06 CSV-chunking fix) so peak memory is bounded by one chunk's raw row-tuple
     overhead plus the running concatenated total, not the full raw result set at once."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(TICKDATA_DB_PATH) as conn:
         _ensure_massive_second_derived_table(conn)
         if build_id is None:
             build_id = get_active_build_id(ticker, 'second', conn=conn)
@@ -1067,7 +1073,7 @@ def get_massive_minute_derived(ticker, build_id=None):
     since hourly's and minute's own "latest build with rows" CAN diverge -- see
     active_builds table's own docstring). Pass an explicit build_id to reproduce an
     older vintage exactly."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(TICKDATA_DB_PATH) as conn:
         _ensure_massive_minute_derived_table(conn)
         if build_id is None:
             build_id = get_active_build_id(ticker, 'minute', conn=conn)
@@ -1178,7 +1184,7 @@ def record_massive_minute_build(build_id, ticker, label, raw_data_pulled_at, raw
 
 
 def get_massive_minute_derived_builds(ticker=None):
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(TICKDATA_DB_PATH) as conn:
         _ensure_massive_minute_derived_builds_table(conn)
         conn.row_factory = sqlite3.Row
         q = "SELECT * FROM massive_minute_derived_builds"
