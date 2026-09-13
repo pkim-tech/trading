@@ -161,10 +161,10 @@ def fmt(v):
 
 
 def print_table(results):
-    header = (f"{'ticker':6s} | {'L-core':>7s} {'L-addon':>7s} {'L-drt':>7s} {'L-both':>7s} {'L-wn':>7s} | "
+    header = (f"{'ticker':6s} {'via':>12s} | {'L-core':>7s} {'L-addon':>7s} {'L-drt':>7s} {'L-both':>7s} {'L-wn':>7s} | "
               f"{'P-core':>7s} {'P-addon':>7s} {'P-drt':>7s} {'P-both':>7s} {'P-wn':>7s} | winners (core/addon/drt/both)")
     print(header)
-    for r in results:
+    for label, r in results:
         if r is None:
             continue
         L, P = r["live"], r["pick"]
@@ -188,20 +188,58 @@ def print_table(results):
         note = "/".join(winners)
         if stale_flags:
             note += "  [" + "; ".join(stale_flags) + "]"
-        print(f"{r['ticker']:6s} | {fmt(L.get('core')):>7s} {fmt(L.get('addon')):>7s} "
+        print(f"{r['ticker']:6s} {label:>12s} | {fmt(L.get('core')):>7s} {fmt(L.get('addon')):>7s} "
               f"{fmt(L.get('drought')):>7s} {fmt(L.get('both')):>7s} {fmt(L.get('worst_neighbor')):>7s} | "
               f"{fmt(P.get('core')):>7s} {fmt(P.get('addon')):>7s} {fmt(P.get('drought')):>7s} "
               f"{fmt(P.get('both')):>7s} {fmt(P.get('worst_neighbor')):>7s} | {note}")
 
 
+def best_candidates_for_ticker(conn, ticker, version, min_trades=50):
+    """Auto-resolves the best-by-CAGR-Drought and best-by-CAGR-Both candidate_nodes ids
+    from the real core_safe population (phase4_results.core_safe=1 AND n_trades>=
+    min_trades) for (ticker, version) -- the same population/threshold candidate_full_
+    review_two_tab.py's --full-review-population core_safe uses. Ranked on phase4_results'
+    own columns (core_drought_cagr_ungated_pct/core_both_cagr_pct), NOT candidate_
+    verification_results' Phase5 fallback -- this is a "what's the best real GT-checked
+    candidate" query, not a live-vs-pick unit comparison, so no per-row units juggling
+    is needed here (unlike _resolve() above). Returns (best_drought_id, best_both_id),
+    either None if the core_safe population is empty for this scope."""
+    row = conn.execute(
+        "SELECT cn.id FROM candidate_nodes cn JOIN phase4_results pr ON pr.candidate_id=cn.id "
+        "WHERE cn.ticker=? AND cn.version=? AND pr.core_safe=1 AND pr.n_trades>=? "
+        "AND pr.core_drought_cagr_ungated_pct IS NOT NULL "
+        "ORDER BY pr.core_drought_cagr_ungated_pct DESC LIMIT 1",
+        (ticker, version, min_trades)).fetchone()
+    best_drought = row[0] if row else None
+    row = conn.execute(
+        "SELECT cn.id FROM candidate_nodes cn JOIN phase4_results pr ON pr.candidate_id=cn.id "
+        "WHERE cn.ticker=? AND cn.version=? AND pr.core_safe=1 AND pr.n_trades>=? "
+        "AND pr.core_both_cagr_pct IS NOT NULL "
+        "ORDER BY pr.core_both_cagr_pct DESC LIMIT 1",
+        (ticker, version, min_trades)).fetchone()
+    best_both = row[0] if row else None
+    return best_drought, best_both
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pair", action="append", required=True, metavar="TICKER:CANDIDATE_ID",
+    ap.add_argument("--pair", action="append", default=[], metavar="TICKER:CANDIDATE_ID",
                      help="repeatable; candidate_nodes id to compare this ticker's live config against")
     ap.add_argument("--live-id", action="append", default=[], metavar="TICKER:CANDIDATE_ID",
                      help="repeatable; skip live-config auto-resolution and use this known "
                           "candidate_nodes id directly for the ticker's live side")
+    ap.add_argument("--auto-best", action="append", default=[], metavar="TICKER",
+                     help="repeatable; auto-resolves the best-CAGR-Drought and best-CAGR-Both "
+                          "candidate_nodes ids from the real core_safe population (requires "
+                          "--version) and compares each against this ticker's live config -- "
+                          "two rows per ticker, labeled by which category was auto-picked.")
+    ap.add_argument("--version", default=None,
+                     help="real candidate_nodes.version string, required when --auto-best is used")
+    ap.add_argument("--min-trades", type=int, default=50,
+                     help="trades floor for --auto-best's core_safe population. Default 50.")
     args = ap.parse_args()
+    if args.auto_best and not args.version:
+        raise SystemExit("--auto-best requires --version")
 
     live_overrides = {}
     for item in args.live_id:
@@ -213,7 +251,15 @@ def main():
     results = []
     for item in args.pair:
         ticker, pick_id = item.split(":")
-        results.append(compare_one(conn, ticker, int(pick_id), live_overrides.get(ticker)))
+        results.append(("pair", compare_one(conn, ticker, int(pick_id), live_overrides.get(ticker))))
+    for ticker in args.auto_best:
+        best_drought, best_both = best_candidates_for_ticker(conn, ticker, args.version, args.min_trades)
+        if best_drought is not None:
+            results.append(("best-drought", compare_one(conn, ticker, best_drought, live_overrides.get(ticker))))
+        if best_both is not None and best_both != best_drought:
+            results.append(("best-both", compare_one(conn, ticker, best_both, live_overrides.get(ticker))))
+        if best_drought is None and best_both is None:
+            print(f"{ticker}: no core_safe population found for version={args.version!r} -- skipping.")
     conn.close()
     print_table(results)
 
