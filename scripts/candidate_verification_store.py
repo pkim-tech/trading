@@ -178,6 +178,54 @@ def insert_trades(conn, candidate_id, resolution, version, ticker, strategy, fix
     return after - before, len(buffer)
 
 
+# --- phase5_drought_windows: drought overlay's own buy/manage windows (2026-09-13,
+# Phase4/Phase5 trade-persistence gap, docs/watchlist_candidate_checklist.md check 19) ---
+# A drought window (backtester.simulate_drought_overlay_ground_truth's own 'best_rets'/
+# 'best_window_times') is NOT a real strategy trade -- no fixed-SL/arm/trail-exit shape,
+# just a buy-and-manage interval between two real signals -- so it doesn't fit phase5_
+# trades' trade_idx/armed/arm_time/arm_price columns without conflating the two. Separate
+# sibling table instead, same INSERT OR IGNORE/before-after-count convention as
+# insert_trades above.
+def ensure_drought_windows_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS phase5_drought_windows (
+            candidate_id INTEGER, ticker TEXT, strategy TEXT, version TEXT,
+            resolution TEXT, window_idx INTEGER, start_time TEXT, end_time TEXT,
+            return_pct REAL, confirm_days INTEGER, vol_gate REAL, created_at TEXT,
+            UNIQUE(candidate_id, resolution, window_idx)
+        )""")
+
+
+def insert_drought_windows(conn, candidate_id, ticker, strategy, version, resolution, drought):
+    """`drought` is a real backtester.simulate_drought_overlay_ground_truth() return dict
+    (or None / a dict with best_rets=None -- both no-ops, nothing to persist). Returns
+    (n_newly_inserted, n_total_in_buffer), same shape as insert_trades."""
+    if drought is None or not drought.get("best_rets"):
+        return 0, 0
+    ensure_drought_windows_table(conn)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+    buffer = []
+    for i, (ret, (start_t, end_t)) in enumerate(zip(drought["best_rets"], drought["best_window_times"])):
+        buffer.append((
+            candidate_id, ticker, strategy, version, resolution, i, str(start_t), str(end_t),
+            ret * 100, drought["best_confirm_days"], drought["best_vol_gate"], now_iso,
+        ))
+    before = conn.execute(
+        "SELECT COUNT(*) FROM phase5_drought_windows WHERE candidate_id=? AND resolution=?",
+        (candidate_id, resolution)).fetchone()[0]
+    conn.executemany("""
+        INSERT OR IGNORE INTO phase5_drought_windows
+            (candidate_id, ticker, strategy, version, resolution, window_idx,
+             start_time, end_time, return_pct, confirm_days, vol_gate, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, buffer)
+    conn.commit()
+    after = conn.execute(
+        "SELECT COUNT(*) FROM phase5_drought_windows WHERE candidate_id=? AND resolution=?",
+        (candidate_id, resolution)).fetchone()[0]
+    return after - before, len(buffer)
+
+
 # --- backtest_winner_trades read-back (Task #1, 2026-08-29 planner dispatch, Phase4 TRADES) ---
 # Phase4 (build_candidate_report_ground_truth in run_optimization_sweep.py) used to ALWAYS
 # re-simulate every candidate's trades via run_backtest_ground_truth, even though Phase2.5

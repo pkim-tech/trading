@@ -388,10 +388,23 @@ is ~160 candidates/campaign (not the full ~13,000-candidate sweep pool), so the 
 over-write + later delete is cheap either way — this replaces the earlier
 "persist_trades flag called only for the winning candidate_id at promotion time" plan,
 which would have required either a real resim or a separate ephemeral cache table; this
-way `phase5_trades` itself doubles as the temporary cache, no new schema needed. Not yet
-built as of this writing — needs the write step added to `gt_full_review_rows`, and a
-delete-non-winners script (or a `--ticker`/`--campaign`-scoped mode of an existing prune
-tool) for the cleanup half.
+way `phase5_trades` itself doubles as the temporary cache, no new schema needed.
+
+**Built 2026-09-13 (coder3)**: write step added to `gt_full_review_rows` (calls
+`candidate_verification_store.insert_trades`/`insert_drought_windows` right after
+`node_id` resolution, off the same real `trades`/`drought` objects already computed for
+CAGR — no second resim), so any future Phase 9 run persists its whole curated population
+automatically. `scripts/prune_phase5_trades_non_winners.py` (delete-non-winners cleanup,
+verify-then-delete/dry-run-by-default) built and ready, not yet run against any campaign.
+`scripts/backfill_candidate_trades.py` (generalizes the earlier one-off
+`persist_v652_candidate_trades.py`) backfilled trades for the 14 already-promoted
+v6.5.2 candidate_ids (56298/55138/58312/61083/59191/60047/56740/61509/53043/51425/
+50637/54038/52033/50073) plus the 11 old/superseded candidate_ids they replace that
+were still missing data (3 of the 14 old ones — ETHU 38604, GDXU 39781, WEBL 48128 —
+already had v6.5.1-era rows). Every backfilled candidate's resimulated trade count
+matched `candidate_nodes.trades` exactly; CAGR cross-checked against `phase4_results.
+cagr_pct` where available (all within ~1-6pp, consistent with years-window rounding,
+not a resim bug).
 
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix

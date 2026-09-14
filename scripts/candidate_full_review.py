@@ -77,6 +77,7 @@ from candidate_summary_report import (
 from candidate_5min_report import best_safe_node, _node_from_row, _node_key
 from run_overlay_shim import ensure_candidate_nodes_table, ensure_table as ensure_overlay_table
 from locate_best_node import get_or_create_candidate_node, set_pick_comment, get_pick_comment
+from candidate_verification_store import insert_trades, insert_drought_windows
 from walk_forward_check import walk_forward, summarize as summarize_folds
 from train_test_split_check import period_spy_bh
 from run_optimization_sweep import _load_node_inputs, CACHE_DIR, _current_kernel_git_state, _REPORT_GEN_FILES
@@ -2028,6 +2029,21 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
         rec["node_id"] = node_id
         rec["pick"], rec["comment"] = get_pick_comment(conn, node_id)
         rec["calendar_years_pct"] = None  # legacy-only opt-in feature -- GT_SKIP_COLUMNS
+
+        # Trade-level persistence (2026-09-13, docs/watchlist_candidate_checklist.md
+        # check 19 -- the Phase4/Phase5 consolidation ported the CAGR math but never the
+        # trade-by-trade persistence that used to go with it). Writes for the WHOLE
+        # curated population this loop already processes (~160/campaign), not just
+        # winners -- gating to winners only happens later via a separate reviewed
+        # delete pass (prune_phase5_trades_non_winners.py) once promotions are decided,
+        # per the checklist's own "phase5_trades doubles as the temp cache" design.
+        # `trades`/`drought` are the SAME real objects this function already computed
+        # above (row.get("trades")/row.get("drought")) -- no second resim, free write.
+        if trades:
+            insert_trades(conn, node_id, row.get("trades_resolution") or "unknown",
+                          version, ticker, strategy, fixed_sl, trades)
+        insert_drought_windows(conn, node_id, ticker, strategy, version,
+                                row.get("trades_resolution") or "unknown", drought)
 
         add_tranches(rec)
         out_rows.append(rec)
