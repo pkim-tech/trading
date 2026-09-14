@@ -15,6 +15,20 @@ after the first fill). A ticker that's swapped nodes 3+ times could have lost
 real capital at an EARLIER swap that's no longer visible any other way --
 this script finds it directly from the real trade sequence instead.
 
+Folds in closed addon_legs profit/loss onto the parent trade's proceeds
+(2026-09-13 fix, after a real false-positive: AGQ id=526 flagged a $328.30
+"gap" that was actually id=456's addon leg closing at a real -$284.87 loss
+between the core exit and the next entry -- signals_helpers._last_sale_
+recovery already folds this in when it sizes the real order, this script
+just didn't mirror that, so it flagged correct sizing as a gap. Mirrors
+_last_sale_recovery's own leg-profit-not-proceeds rule: only (exit_price -
+entry_price)*shares compounds in, never the leg's raw proceeds (a leg is
+margin-financed, its own capital base is never part of the compounding
+base). Does not replicate _last_sale_recovery's orphan-leg branch (a leg
+whose own parent trade_log row doesn't qualify) -- out of scope for a
+same-ticker chronological trace, which only ever looks at legs whose parent
+IS one of the rows already in this trace.
+
 Usage:
     .venv/bin/python scripts/trace_node_capital_chain.py --ticker AGQ
     .venv/bin/python scripts/trace_node_capital_chain.py --ticker DPST --account ira
@@ -47,6 +61,13 @@ def trace(ticker, account=None):
         print(f"{ticker}: no real trade_log rows found" + (f" for account={account}" if account else ""))
         return
 
+    conn = sqlite3.connect(signals_config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    leg_q = ("SELECT SUM((exit_price - entry_price) * shares) AS profit, MAX(exit_time) AS recency "
+             "FROM addon_legs WHERE parent_trade_log_id=? AND status='closed' "
+             "AND exit_price IS NOT NULL AND shares IS NOT NULL AND is_dry_run_sim=0 "
+             "AND exit_reason != 'ABANDONED'")
+
     print(f"=== {ticker}{f' ({account})' if account else ''}: {len(rows)} real trade(s), chronological ===")
     prev_proceeds = None
     prev_exit_time = None
@@ -68,8 +89,17 @@ def trace(ticker, account=None):
                   f"(${exit_proceeds:,.2f} proceeds)")
             prev_proceeds = exit_proceeds
             prev_exit_time = r["exit_time"]
+            leg_row = conn.execute(leg_q, (r["id"],)).fetchone()
+            if leg_row and leg_row["profit"] is not None:
+                print(f"        + addon leg profit=${leg_row['profit']:,.2f} "
+                      f"(closed {leg_row['recency']}) -> recompounded proceeds="
+                      f"${max(prev_proceeds + leg_row['profit'], 0):,.2f}")
+                prev_proceeds = max(prev_proceeds + leg_row["profit"], 0)
+                if leg_row["recency"] and (prev_exit_time is None or leg_row["recency"] > prev_exit_time):
+                    prev_exit_time = leg_row["recency"]
         else:
             print("        (still open)")
+    conn.close()
 
 
 def main():

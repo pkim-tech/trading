@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Resolved 2026-09-13 — AGQ id=526's $328.30 "sizing gap" was correct compounding (an addon leg's real -$284.87 loss), not a bug; fixed `trace_node_capital_chain.py` to fold in addon_legs so it stops false-flagging this. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-13 — `candidate_full_review_two_tab.py --workers` now routed through `resolve_effective_gt_workers` (real SOXL OOM crash confirmed via dmesg); also fixed a second, more serious bug found along the way — tonight's `tickdata.db` split had silently broken this cap's default connection, meaning `run_gt_mode`'s/`bench_phase1_phase2_inmemory.py`'s existing SOXL protection was non-functional since the split landed. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-09-13 — persist per-phase sweep timing via new `phase_timing.py` (modeled on `script_usage.py`), wired into Phase1/2/2.5/4/9/10 + `scripts/phase_timing_report.py` reader; gated-file diff paired-reviewed, no HIGH/CRITICAL. Full detail: `deep_backlog.md`.
