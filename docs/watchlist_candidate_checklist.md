@@ -313,6 +313,32 @@ open_positions/pending_buys check above. Orders, positions, and watch_list rows 
 interrelated state that can drift out of sync specifically at a strategy-version
 transition, not just a config-param change.
 
+**Extended 2026-09-13 (real 7-ticker promotion pass) — sizing continuity check, do this
+for EVERY promotion that changes the node's `version` and/or `strategy`, not just the
+open-position/order check above**: `signals_helpers._last_sale_recovery` sizes the next
+real buy off the node's own trade_log history, matched by `(ticker, strategy, version,
+window, account)` — a promotion that changes `version` (near-universal, since it's tied
+to the sweep campaign) or `strategy` (e.g. TrailingBoth→TrailingExit) means the NEW node's
+lookup will never match the OLD node's real trade_log rows, so the very next buy silently
+falls back to the flat `starting_notional` instead of compounding off the ticker's real
+last-sold proceeds — exactly the "reset to an idealized size" behavior `_last_sale_recovery`
+exists to avoid. Query the OLD node's real last **closed** trade (`SELECT exit_price,
+shares FROM trade_log WHERE ticker=? AND exit_price IS NOT NULL ORDER BY id DESC LIMIT 1`
+— note the `exit_price IS NOT NULL` filter: the most recent row can be a still-open
+position with NULL exit fields, which looks like "no trades" if you don't filter it out,
+found live 2026-09-13 for DPST/HIBL/KORU) and compare its real proceeds
+(`exit_price * shares`) against the flat `starting_notional` floor. If they differ
+meaningfully, decide explicitly whether to carry the real number forward via
+`signals_db.set_starting_notional_override_once(wl_id, value)` (auto-clears itself after
+the next real fill, normal compounding resumes automatically) or accept the reset —
+don't let it default silently either way. **Sanity-check the number before using it**:
+a proceeds figure landing suspiciously far below the ticker's normal sizing (found live
+2026-09-13: HIBL $1,003.15 and KORU $2,194.20, both far under their real ~$10k target
+sizing, one of them landing on the exact date of a real stock split) may reflect a partial
+fill, a split-distorted price/share-count, or genuinely stale history — worth a second
+look before trusting it as "the real current capital," not just taking the query's
+output at face value.
+
 ## 18. Automation-scope check (REQUIRED ACTION, do this at the moment of live promotion)
 Confirm the ticker is actually in `.env`'s `SCHWAB_AUTOMATION_TICKERS`
 (`schwab_safety.AUTOMATION_ENABLED_TICKERS` at runtime) — `state='live'` alone does NOT
