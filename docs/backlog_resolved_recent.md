@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [tooling][data] Resolved 2026-09-14 — Task #3 (trades_cache.db split) closed: DROP+VACUUM of cliff_addon_cache/backtest_phase1/2_insurance from trading_universe.db run in `research` session after user go-ahead, both blocked earlier by classifier; paired review clean. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-13 — Phase4/Phase5 consolidation never ported trade-level persistence; write step added to `gt_full_review_rows`, delete-non-winners cleanup script built (not yet run), 14 promoted + 11 superseded v6.5.2 candidates backfilled into `phase5_trades`/`phase5_drought_windows`. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Resolved 2026-09-13 — AGQ id=526's $328.30 "sizing gap" was correct compounding (an addon leg's real -$284.87 loss), not a bug; fixed `trace_node_capital_chain.py` to fold in addon_legs so it stops false-flagging this. Full detail: `deep_backlog.md`.

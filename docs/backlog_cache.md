@@ -43,8 +43,8 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [tooling][data] Found 2026-09-13 — trades_cache.db split (Task #3, coder4): cliff_addon_cache + backtest_phase1/2_insurance copied+verified, DROP+repoint+gated review still pending
-Data already safely duplicated in both DBs (row count/checksum verified); DROP blocked by this session's permission classifier, dispatched to coder4 to finish. backtest_cache stays put (90+ consumers, no safe drop path); hurst_cache not yet investigated. Full detail: `deep_backlog.md`.
+## [data][live-trading] Found 2026-09-14 — switching intraday ticks to Massive/Schwab needs an explicit trading-holiday guard
+Yahoo (current live source) apparently just doesn't tick outside real trading hours (unconfirmed — "as far as we know", never explicitly verified). Massive.com and/or Schwab's own tick feed may not have that same property — a tick could show up timestamped during normal Mon-Fri business hours that's actually weekend/market-holiday data (or a stale/bad tick mislabeled), which would look like a legitimate signal-window bar to `active_signals.py`'s window checks. Needs: (1) confirm what Yahoo's actual current behavior is before assuming it as the baseline, (2) add an explicit trading-calendar check (NYSE holiday calendar) before trusting any tick's timestamp as a real session bar once either alternate source is wired in. Not scoped, not started — surfaced while discussing the source switch, no immediate trigger.
 
 ## [backtest][tooling] Found 2026-09-13 — `top_safe_nodes.py`'s absolute `robust_alpha` floor unfairly penalizes short-history tickers (ETHU); user wants a CAGR floor instead, existing partial fix looks unwired
 Not urgent — today's real Phase 9/10 reports don't use this path. Full detail: `deep_backlog.md`.
