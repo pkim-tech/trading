@@ -543,7 +543,7 @@ def _insert_phase1_insurance_rows(rows, strategy_name, config_version, ticker, f
     Generic axis-agnostic columns (take_profit/stop_loss/trail_sell_pct = raw grid axis
     values, NOT strategy-remapped column meanings) -- no need to pretend to be
     backtest_cache-compatible since nothing else reads this table."""
-    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+    with sqlite3.connect(TRADES_DB_PATH, timeout=60.0) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_phase1_insurance (
                 strategy TEXT, version TEXT, ticker TEXT, fixed_sl REAL, entry_timing TEXT,
@@ -590,7 +590,7 @@ def _insert_phase2_insurance_rows(rows, strategy_name, config_version, ticker, f
     One extra `generation` column vs Phase1's schema -- Phase2 rows genuinely carry this
     (which Phase2-island generation first computed the cell, 1-indexed), Phase1 rows
     don't have an equivalent concept."""
-    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+    with sqlite3.connect(TRADES_DB_PATH, timeout=60.0) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_phase2_insurance (
                 strategy TEXT, version TEXT, ticker TEXT, fixed_sl REAL, entry_timing TEXT,
@@ -910,10 +910,12 @@ def _clear_prior_seed_mode_table_rows(table_name, strategy_name, config_version,
     two vintages coexisting under one version with no way to tell which run produced
     which -- precisely the union-under-identical-version failure this mechanism was
     built to prevent."""
-    # backtest_winner_trades lives in TRADES_DB_PATH (2026-09-13 split); every other
-    # table this is ever called for (backtest_phase1_insurance, backtest_phase2_insurance,
-    # candidate_nodes) still lives in DB_PATH.
-    _db_path = TRADES_DB_PATH if table_name == "backtest_winner_trades" else DB_PATH
+    # backtest_winner_trades/backtest_phase1_insurance/backtest_phase2_insurance all
+    # live in TRADES_DB_PATH now (2026-09-13 splits); candidate_nodes (the only other
+    # table this is ever called for) still lives in DB_PATH.
+    _TRADES_DB_TABLES = ("backtest_winner_trades", "backtest_phase1_insurance",
+                         "backtest_phase2_insurance")
+    _db_path = TRADES_DB_PATH if table_name in _TRADES_DB_TABLES else DB_PATH
     with sqlite3.connect(_db_path, timeout=60.0) as conn:
         existing_tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))}
@@ -2396,7 +2398,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       _checkpoint_source = "computed"
       if args.resume_from_top100:
           t0 = time.time()
-          with sqlite3.connect(DB_PATH) as conn:
+          with sqlite3.connect(TRADES_DB_PATH) as conn:
               df1 = pd.read_sql("""
                   SELECT take_profit, stop_loss, max_hold_hours, window,
                          z_score_threshold, trail_sell_pct, cagr, trades

@@ -26,10 +26,14 @@ CACHE_DIR    = Path("./cache/research")
 OPTO_LOG_DIR = Path("./logs")
 OPTO_LOG_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = CACHE_DIR / "trading_universe.db"
-# backtest_winner_trades lives in its own file (2026-09-13 split, ~12.2M rows) --
-# every real reader/writer of that table now connects here, never DB_PATH. phase5_trades
-# (a DIFFERENT table, read via get_phase5_1s_trades) was NOT part of this split and still
-# lives in DB_PATH -- see get_cached_trades vs get_phase5_1s_trades call sites below.
+# Multiple real production tables now live in this separate file, each moved out of
+# DB_PATH in its own 2026-09-13 split: backtest_winner_trades (~12.2M rows),
+# cliff_addon_cache (~2.9M rows), backtest_phase1_insurance (~1.2M rows),
+# backtest_phase2_insurance (~0.5M rows). Every real reader/writer of any of these
+# connects here, never DB_PATH. phase5_trades/candidate_nodes/sweep_run_log/
+# backtest_overlay_trades are DIFFERENT tables that were NOT part of any of these
+# splits and still live in DB_PATH -- see get_cached_trades vs get_phase5_1s_trades
+# call sites below for the pattern when one function needs both.
 TRADES_DB_PATH = CACHE_DIR / "trades_cache.db"
 
 FINE_RADIUS    = 4
@@ -3572,7 +3576,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     # avoidance this cache exists for. A future pass extending cliff_addon_cache's own PK
     # to include fill_resolution properly would remove this restriction.
     use_cache = fill_resolution == 'minute'
-    cache_conn = sqlite3.connect(DB_PATH, timeout=60.0) if use_cache else None
+    # cliff_addon_cache lives in TRADES_DB_PATH (2026-09-13 split).
+    cache_conn = sqlite3.connect(TRADES_DB_PATH, timeout=60.0) if use_cache else None
     addon_cache_map = None
     new_cache_rows = None
     if use_cache:
