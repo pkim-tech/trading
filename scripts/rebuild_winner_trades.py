@@ -23,7 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from run_optimization_sweep import DB_PATH, _load_node_inputs_ground_truth
+from run_optimization_sweep import DB_PATH, TRADES_DB_PATH, _load_node_inputs_ground_truth
 from backtester import run_backtest_ground_truth
 from node_key import node_key, GT_TRADES_KERNEL_VERSION
 import strategies
@@ -146,7 +146,7 @@ def main():
     t1 = time.time()
     print(f"Regenerated {len(buffer):,} trade rows across {len(rows)} candidates in {t1 - t0:.2f}s")
 
-    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+    with sqlite3.connect(TRADES_DB_PATH, timeout=60.0) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_winner_trades (
                 node_key TEXT, version TEXT, ticker TEXT, strategy TEXT, fixed_sl REAL,
@@ -156,7 +156,17 @@ def main():
                 UNIQUE(node_key, version, trade_idx)
             )""")
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_winner_trades)")}
-        for col in ("kernel_version TEXT", "hourly_build_id INTEGER", "minute_build_id INTEGER"):
+        # fill_resolution (2026-09-13, contextual paired-review LOW finding on the
+        # trades_cache.db split): this script's own CREATE TABLE predates bench_
+        # phase1_phase2_inmemory.py's fill_resolution column, and sqlite3.connect()
+        # silently creates an empty trades_cache.db if this script ever runs first
+        # against a fresh file (e.g. wrong CWD) -- without this column in the ALTER
+        # list here too, get_cached_trades' SELECT of fill_resolution would raise
+        # OperationalError on every lookup against a table this script created,
+        # a silent 100% cache miss rather than an error. Self-heals once bench's own
+        # writer runs, but free to close here.
+        for col in ("kernel_version TEXT", "hourly_build_id INTEGER", "minute_build_id INTEGER",
+                    "fill_resolution TEXT"):
             name = col.split()[0]
             if name not in existing_cols:
                 conn.execute(f"ALTER TABLE backtest_winner_trades ADD COLUMN {col}")

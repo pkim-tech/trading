@@ -43,7 +43,7 @@ from run_optimization_sweep import (
     compute_bh_returns, window_version_suffix, run_single_backtest_node_ground_truth_isolated,
     _trail_pcts_for_strategy, pick_island_centers, FINE_RADIUS, N_ISLANDS,
     CLIFF_RADIUS, PHASE25_ISLAND_CLIFFBOX_CAGR_MIN, GT_CANDIDATE_TIEBREAK,
-    DB_PATH, _load_node_inputs_ground_truth, _load_minute_df, _load_second_df,
+    DB_PATH, TRADES_DB_PATH, _load_node_inputs_ground_truth, _load_minute_df, _load_second_df,
     _load_hourly_df_ground_truth,
 )
 from run_ground_truth_neighborhood import load_live_node
@@ -910,7 +910,11 @@ def _clear_prior_seed_mode_table_rows(table_name, strategy_name, config_version,
     two vintages coexisting under one version with no way to tell which run produced
     which -- precisely the union-under-identical-version failure this mechanism was
     built to prevent."""
-    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+    # backtest_winner_trades lives in TRADES_DB_PATH (2026-09-13 split); every other
+    # table this is ever called for (backtest_phase1_insurance, backtest_phase2_insurance,
+    # candidate_nodes) still lives in DB_PATH.
+    _db_path = TRADES_DB_PATH if table_name == "backtest_winner_trades" else DB_PATH
+    with sqlite3.connect(_db_path, timeout=60.0) as conn:
         existing_tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))}
         if not existing_tables:
@@ -967,7 +971,7 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
     DELETE-then-INSERT avoids both failure modes: every (node_key, version) pair this
     call is about to write gets its ENTIRE old row set removed first, so a re-run is a
     genuine full replacement, never a partial merge."""
-    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+    with sqlite3.connect(TRADES_DB_PATH, timeout=60.0) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_winner_trades (
                 node_key TEXT, version TEXT, ticker TEXT, strategy TEXT, fixed_sl REAL,

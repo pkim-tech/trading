@@ -26,6 +26,11 @@ CACHE_DIR    = Path("./cache/research")
 OPTO_LOG_DIR = Path("./logs")
 OPTO_LOG_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = CACHE_DIR / "trading_universe.db"
+# backtest_winner_trades lives in its own file (2026-09-13 split, ~12.2M rows) --
+# every real reader/writer of that table now connects here, never DB_PATH. phase5_trades
+# (a DIFFERENT table, read via get_phase5_1s_trades) was NOT part of this split and still
+# lives in DB_PATH -- see get_cached_trades vs get_phase5_1s_trades call sites below.
+TRADES_DB_PATH = CACHE_DIR / "trades_cache.db"
 
 FINE_RADIUS    = 4
 N_ISLANDS      = 3
@@ -4353,7 +4358,12 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     # _second_build_id/_resim_fill_resolution: resolved earlier in this function now
     # (moved 2026-09-07 so the addon/cliff-safety pass above can reuse the same
     # decision -- see that call site's own comment), reused here unchanged.
-    _trades_conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    # Two separate connections (2026-09-13 trades_cache.db split): get_phase5_1s_trades
+    # reads phase5_trades (still in DB_PATH), get_cached_trades reads backtest_winner_trades
+    # (now in TRADES_DB_PATH) -- these are two different sqlite files, no single connection
+    # can serve both.
+    _phase5_conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    _trades_conn = sqlite3.connect(TRADES_DB_PATH, timeout=60.0)
 
     rows = []
     try:
@@ -4369,7 +4379,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             # candidates only, via cand['id']; a legacy backtest_cache-sourced candidate
             # has no 'id' key and this is a no-op None for it, same as today).
             cached_trades = _get_phase5_1s_trades(
-                _trades_conn, cand.get('id'), ticker=ticker, strategy=strategy_name,
+                _phase5_conn, cand.get('id'), ticker=ticker, strategy=strategy_name,
                 fixed_sl=fixed_sl, start_date=start_date, end_date=end_date)
             trades_resolution = '1s' if cached_trades is not None else None
             if cached_trades is None:
@@ -4588,6 +4598,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             })
     finally:
         _trades_conn.close()
+        _phase5_conn.close()
 
     # cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md Step 4): CAGR is
     # the sole GT selection metric now -- this is the single most consequential ranking
