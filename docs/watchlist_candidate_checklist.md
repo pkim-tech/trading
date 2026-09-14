@@ -5,7 +5,7 @@ existing one after a macro/regime concern is raised). All checks use only cached
 data + yfinance 5-min bars — no broker/live data needed.
 
 ## 0. Live-vs-candidate screening check (added 2026-09-08 — mechanical pre-check, run first)
-Before spending effort on checks 1-18 below: pull the candidate's and the current live
+Before spending effort on checks 1-19 below: pull the candidate's and the current live
 node's already-EXISTING stored numbers only (`candidate_verification_results`/
 `phase4_results` — never trigger a fresh Phase4 scope recompute for this step, that's
 real, avoidable cost; see `docs/research_log.md`'s 2026-09-08 entry on why a scope-wide
@@ -353,6 +353,46 @@ promotion batch). Add the ticker to `.env` and **restart the daemon** — the li
 from the environment once at import time, so an `.env` edit alone does not take effect on
 a running process.
 
+## 19. Trade-level persistence check (REQUIRED ACTION, do this at the moment of promotion)
+Confirm `phase5_trades` (core trail) has real rows for the promoted `candidate_id` —
+`SELECT COUNT(*) FROM phase5_trades WHERE candidate_id=?` — and `phase5_drought_windows`
+too if the promotion includes a drought overlay. Found 2026-09-13: the Phase4/Phase5
+consolidation (`24a6776`) ported the CAGR math but never the trade-by-trade persistence
+that used to come with it — Phase4 computes the trade list in memory to derive CAGR, then
+discards it, so `phase5_trades` silently stopped growing past `candidate_id=49546`
+(pre-v6.5.2) even though `phase4_results` has real CAGR for everything promoted since.
+Only discovered while trying to do a real historical capital-overlap walk that needed
+actual entry/exit timing — a "we'll never need the raw trades" assumption that turned out
+wrong. **Scope: winners only** (promoted candidates), not the full curated population —
+persisting for every curated candidate (159-171/campaign) is real, avoidable cost;
+backfill a specific non-winner's trades on demand later if an analysis turns out to need
+one after all. **Storage shape, decided 2026-09-13**: one core trade trail per candidate
+in `phase5_trades` (reuse `candidate_verification_store.insert_trades`, same schema/upsert
+`scripts/phase5_second_level_overlay_check.py` already uses) plus drought's own
+buy/manage windows in `phase5_drought_windows` if applicable (a drought window doesn't fit
+the trade_idx/armed shape, so it gets its own table rather than being forced into one) —
+core/addon/drought/overlay(=both) are 4 *computed-return passes* over that one persisted
+trail (+ windows), not 4 separately stored trail copies; addon's own timing is derivable
+from the trail's existing `armed`/`arm_time`/`arm_price` columns, no separate addon-trades
+table needed. **Hook point, revised 2026-09-13 (avoids a promotion-time resim entirely)**: `candidate_
+full_review.gt_full_review_rows` writes trades to `phase5_trades`/`phase5_drought_windows`
+for the WHOLE curated population as it computes them for CAGR during Phase 9 (`candidate_
+full_review_two_tab.py`, real per-ticker GT resim right after Phase 1-4 — NOT Phase 10,
+which only aggregates Phase 9's already-computed snapshots into the final Excel sheet, no
+recompute of its own). Phase 9 already has the trade list in memory, so persisting there
+is free — not gated to winners at write time. Once a campaign's promotion decisions are
+finalized, run a reviewed delete
+pass (same verify-then-delete convention as the `prune-validation` skill) removing the
+non-promoted candidates' rows, keeping only actual winners long-term. Curated population
+is ~160 candidates/campaign (not the full ~13,000-candidate sweep pool), so the temporary
+over-write + later delete is cheap either way — this replaces the earlier
+"persist_trades flag called only for the winning candidate_id at promotion time" plan,
+which would have required either a real resim or a separate ephemeral cache table; this
+way `phase5_trades` itself doubles as the temporary cache, no new schema needed. Not yet
+built as of this writing — needs the write step added to `gt_full_review_rows`, and a
+delete-non-winners script (or a `--ticker`/`--campaign`-scoped mode of an existing prune
+tool) for the cleanup half.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds
@@ -378,3 +418,6 @@ a running process.
 - Whenever a live ticker's live behavior seems to be diverging from backtest expectations
   (the AGQ momentum discussion, 2026-07-12, is what prompted writing this down).
 - Not needed on every session — this is a promotion/investigation gate, not a routine poll.
+- **Check 19 (trade-level persistence): at the moment of promotion, same as checks 14/18**
+  — the trade list is cheapest to persist right when the candidate is being promoted
+  (already resimulated for the review), not re-derived later from scratch.
