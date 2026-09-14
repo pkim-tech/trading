@@ -104,6 +104,30 @@ def check_old_node_clear(old_wl_id, force):
     return n_pos, n_pending
 
 
+def real_last_sold_proceeds(old_wl_id):
+    """Checklist item 17's sizing-continuity extension (added 2026-09-13, real
+    incident: a 2026-09-11 SOXL promotion silently reset to the flat $10,000
+    floor instead of carrying forward its real $10,712.16 last-sold proceeds,
+    undiscovered for 2 days until an unrelated audit caught it -- the new
+    node had gone 2 days with zero real trades, so the fix still applied in
+    time, but only by luck). A promotion that changes `version`/`strategy`
+    breaks signals_helpers._last_sale_recovery's trade_log match -- see
+    feedback_scope_trade_queries_by_wl_id memory and
+    scripts/check_node_capital_tracking.py for the same query, standalone.
+    Returns None if the old node has no real closed trade (nothing to carry
+    forward -- the flat notional IS correct in that case)."""
+    if old_wl_id is None:
+        return None
+    conn = sqlite3.connect("cache/live/trading_live.db", timeout=15)
+    row = conn.execute(
+        "SELECT exit_price, shares FROM trade_log WHERE wl_id=? AND is_dry_run_sim=0 "
+        "AND exit_price IS NOT NULL ORDER BY id DESC LIMIT 1", (old_wl_id,)).fetchone()
+    conn.close()
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    return row[0] * row[1]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--candidate-id", type=int, required=True)
@@ -120,6 +144,12 @@ def main():
                      help="extra text appended to the auto-generated label, e.g. checklist summary")
     ap.add_argument("--force", action="store_true",
                      help="skip the check-17 open-position/pending-order refusal")
+    ap.add_argument("--no-carry-forward", action="store_true",
+                     help="skip auto-applying the old node's real last-sold proceeds as a "
+                          "starting_notional_override_once on the new node (checklist 17's "
+                          "sizing-continuity extension) -- use this if you've deliberately "
+                          "decided the flat --notional floor is correct instead (e.g. real "
+                          "capital was added/removed since the old node's last trade).")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -143,9 +173,24 @@ def main():
         drought_overlay_enabled=int(args.drought), label=label,
     )
 
+    carry_forward = None
     if args.old_wl_id is not None:
         n_pos, n_pending = check_old_node_clear(args.old_wl_id, args.force) or (0, 0)
         plan["old_wl_id_status"] = f"open_positions={n_pos}, pending_buys={n_pending}"
+        if not args.no_carry_forward:
+            carry_forward = real_last_sold_proceeds(args.old_wl_id)
+            if carry_forward is not None:
+                plan["sizing_continuity"] = (
+                    f"old wl_id={args.old_wl_id}'s real last-sold proceeds "
+                    f"(${carry_forward:,.2f}) will be auto-applied as a "
+                    f"starting_notional_override_once on the new node (checklist 17 "
+                    f"extension) -- differs from flat --notional=${args.notional:,.2f} "
+                    f"by ${carry_forward - args.notional:,.2f}. Pass --no-carry-forward "
+                    f"to skip this.")
+            else:
+                plan["sizing_continuity"] = (
+                    f"old wl_id={args.old_wl_id} has no real closed trade -- flat "
+                    f"--notional=${args.notional:,.2f} is correct, nothing to carry forward.")
 
     if args.dry_run:
         print("DRY RUN -- no DB writes. Derived plan:")
@@ -180,6 +225,12 @@ def main():
         c.commit()
     print(f"  wl_id={new_id}, account={args.account}, notional=${args.notional:,.0f}, "
           f"addon_enabled={int(args.addon)}, drought_overlay_enabled={int(args.drought)}")
+
+    if carry_forward is not None:
+        signals_db.set_starting_notional_override_once(new_id, carry_forward)
+        print(f"  Sizing continuity: carried forward ${carry_forward:,.2f} from old "
+              f"wl_id={args.old_wl_id} as starting_notional_override_once "
+              f"(auto-clears after the next real fill).")
 
     print("\nSeeding config-drift baseline (check 14)...")
     subprocess.run([sys.executable, "scripts/seed_baseline_config.py"], check=True)
