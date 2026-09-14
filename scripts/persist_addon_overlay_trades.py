@@ -37,7 +37,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from run_optimization_sweep import DB_PATH
+from run_optimization_sweep import DB_PATH, TRADES_DB_PATH
 from backtester import apply_addon_overlay_ground_truth
 from node_key import GT_TRADES_KERNEL_VERSION
 from candidate_verification_store import get_cached_trades
@@ -57,14 +57,20 @@ def main():
     if args.fixed_sl is not None:
         query += " AND fixed_sl=?"
         params.append(args.fixed_sl)
-    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
-        node_keys = conn.execute(query, params).fetchall()
-        if not node_keys:
-            raise SystemExit(f"No backtest_winner_trades rows for ticker={args.ticker} "
-                              f"strategy={args.strategy} version={args.version} "
-                              f"fixed_sl={args.fixed_sl} -- nothing to overlay.")
-        print(f"Found {len(node_keys)} distinct node_keys to add-on-overlay.")
+    # Two separate connections (2026-09-13 trades_cache.db split): backtest_winner_trades
+    # (read-only here, via trades_conn) now lives in TRADES_DB_PATH; backtest_overlay_trades
+    # (this script's own write target, via conn) stays in DB_PATH -- these are two
+    # different sqlite files, no single connection/transaction can span both.
+    with sqlite3.connect(TRADES_DB_PATH, timeout=60.0) as trades_conn:
+        node_keys = trades_conn.execute(query, params).fetchall()
+    if not node_keys:
+        raise SystemExit(f"No backtest_winner_trades rows for ticker={args.ticker} "
+                          f"strategy={args.strategy} version={args.version} "
+                          f"fixed_sl={args.fixed_sl} -- nothing to overlay.")
+    print(f"Found {len(node_keys)} distinct node_keys to add-on-overlay.")
 
+    with sqlite3.connect(TRADES_DB_PATH, timeout=60.0) as trades_conn, \
+            sqlite3.connect(DB_PATH, timeout=60.0) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_overlay_trades (
                 node_key TEXT, version TEXT, ticker TEXT, strategy TEXT, fixed_sl REAL,
@@ -93,7 +99,7 @@ def main():
         n_skipped_stale = 0
         for node_key, fixed_sl in node_keys:
             trades = get_cached_trades(
-                conn, node_key, args.version, ticker=args.ticker,
+                trades_conn, node_key, args.version, ticker=args.ticker,
                 kernel_version=GT_TRADES_KERNEL_VERSION,
                 hourly_build_id=hourly_build_id, minute_build_id=minute_build_id)
             if trades is None:
