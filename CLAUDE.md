@@ -109,7 +109,7 @@ Full build/bugfix history for every file below: `docs/deep_backlog.md` (search b
 
 ## Runtime Artifacts (not committed)
 - `cache/live/` — the real trade record: `trading_live.db` plus pre-migration `.bak` snapshots, `trading_sim.db` (live-sim testing), `active_signals_heartbeat.txt`
-- `cache/research/` — regenerable research data: hourly CSV per ticker, `trading_universe.db` (+ daily/weekly `.bak` rotations), `watchlist_sweep.db`, `dismissed_tickers.json`
+- `cache/research/` — regenerable research data: hourly CSV per ticker, `trading_universe.db` (+ daily/weekly `.bak` rotations), `tickdata.db` (2026-09-13: split out of `trading_universe.db` — holds `massive_hourly_derived`/`massive_minute_derived`/`massive_second_derived` + their `_builds` tables, `massive_dividends_raw`, `massive_hourly_corrections`, `active_builds`; `db_cache.TICKDATA_DB_PATH`), `watchlist_sweep.db`, `dismissed_tickers.json`
 - `logs/` — optimization output PNGs, CSVs, text reports
 - `output/` — script outputs/exports/reports (not cache): `*_trades.xlsx`, `live_backups/` (hourly `trading_live.db` snapshots), archived/legacy files
 - `active_phase_grid.json` — live progress state written during sweep runs
