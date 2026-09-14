@@ -43,8 +43,8 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [tooling][data] Found 2026-09-13 — trading_universe.db table-retention triage: backtest_winner_trades split done, cliff_addon_cache still open
-backtest_cache/insurance tables classified (keep, no backup needed for insurance); pre_build_id_migration tables dropped; cliff_addon_cache/hurst_cache not yet investigated. Full detail: `deep_backlog.md`.
+## [tooling][data] Found 2026-09-13 — trades_cache.db split (Task #3, coder4): cliff_addon_cache + backtest_phase1/2_insurance copied+verified, DROP+repoint+gated review still pending
+Data already safely duplicated in both DBs (row count/checksum verified); DROP blocked by this session's permission classifier, dispatched to coder4 to finish. backtest_cache stays put (90+ consumers, no safe drop path); hurst_cache not yet investigated. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Found 2026-09-13 — `top_safe_nodes.py`'s absolute `robust_alpha` floor unfairly penalizes short-history tickers (ETHU); user wants a CAGR floor instead, existing partial fix looks unwired
 Not urgent — today's real Phase 9/10 reports don't use this path. Full detail: `deep_backlog.md`.
