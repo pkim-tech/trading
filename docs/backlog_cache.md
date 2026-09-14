@@ -43,6 +43,9 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
+## [live-trading] Found 2026-09-13 — AGQ real trade (id=526) shows a $328.30 sizing gap larger than one share, with zero top-up coverage_events logged (not blocked, just never attempted)
+Found via `scripts/trace_node_capital_chain.py` (new tonight) tracing AGQ's real chronological trade sequence. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Found 2026-09-13 — Phase4/Phase5 consolidation never ported trade-level persistence; add a store step to the curated-population trade list Phase 9/10 already computes
 Confirmed: `phase5_trades`'s highest-ever `candidate_id` is 49546 -- nothing from v6.5.2+ has trade-level data, even though `phase4_results` has real CAGR numbers for those same candidates. Full detail: `deep_backlog.md`.
 
