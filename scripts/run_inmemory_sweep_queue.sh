@@ -165,6 +165,20 @@ fi
 
 cd "$(dirname "$0")/.."
 
+# Singleton guard (2026-09-15, real incident: two independent invocations of this
+# script ran concurrently overnight, each independently claim-next-ing jobs off the
+# SAME campaign's queue -- exactly the "only tested/supported usage is ONE drain loop
+# per campaign" limitation documented above, hit for real, doubling CPU/memory load
+# from two full --workers pools running at once). flock on a fixed lockfile refuses a
+# second concurrent instance outright rather than relying on remembering to check
+# `ps`/`campaign_registry.py status` before launching.
+mkdir -p logs
+exec 200>logs/.run_inmemory_sweep_queue.lock
+if ! flock -n 200; then
+    echo "Another run_inmemory_sweep_queue.sh is already running (lock: logs/.run_inmemory_sweep_queue.lock) -- refusing to start a second concurrent drain loop. Check 'ps aux | grep run_inmemory_sweep_queue' / '.venv/bin/python scripts/campaign_registry.py status' before retrying." >&2
+    exit 1
+fi
+
 # Unbuffered stdout (2026-08-29, real bug found): without this, Python buffers
 # stdout when writing to a pipe/file (not a TTY) -- print() output including
 # tqdm's progress bar and all PROGRESS: markers can sit invisibly in an

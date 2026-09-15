@@ -58,6 +58,7 @@ import time
 import subprocess
 import threading
 import contextlib
+import fcntl
 import functools
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
@@ -754,7 +755,29 @@ def _guarded(section: str, fn, *args, **kwargs):
         return None
 
 
+_RUN_LOCK_FH = None  # module-level so the fd (and its flock) survives for run_loop's whole life
+
+
+def _acquire_run_lock():
+    """Refuse a second concurrent `active_signals.py run` (2026-09-15, added after a real
+    incident where two independent instances of a sweep queue script ran concurrently
+    against the same campaign, doubling CPU/memory load -- the daemon has no equivalent
+    guard today, and two live daemons double-placing orders/Slack alerts against the same
+    watch_list would be far worse). flock is non-blocking: a second invocation exits
+    immediately instead of silently running alongside the first."""
+    global _RUN_LOCK_FH
+    lock_path = HEARTBEAT_PATH.parent / "active_signals_run.lock"
+    _RUN_LOCK_FH = open(lock_path, "w")
+    try:
+        fcntl.flock(_RUN_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"Another active_signals.py run is already active (lock: {lock_path}). "
+              f"Refusing to start a second daemon.", file=sys.stderr)
+        sys.exit(1)
+
+
 def run_loop(tickers: set = None):
+    _acquire_run_lock()
     ensure_tables()
     schwab_safety.sync_automation_scope()
 

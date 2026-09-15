@@ -27,6 +27,18 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# Singleton guard (2026-09-15, added after a real incident where two concurrent
+# instances of the sibling run_inmemory_sweep_queue.sh doubled CPU/memory load
+# overnight): this script also isn't safe to run twice concurrently -- both
+# instances would stomp the same config.json.bak/trap-restore dance below. flock
+# refuses a second concurrent instance outright.
+mkdir -p logs
+exec 200>logs/.run_sweep_queue.lock
+if ! flock -n 200; then
+    echo "Another run_sweep_queue.sh is already running (lock: logs/.run_sweep_queue.lock) -- refusing to start a second concurrent instance." >&2
+    exit 1
+fi
+
 PYTHON=".venv/bin/python"
 VERSION="${VERSION:-v5}"
 TICKERS="${TICKERS:-AGQ DPST DUST GDXD GDXU HIBL KORU LABU NAIL NUGT RETL SOXL TQQQ UDOW USD UVIX YANG ZSL}"
