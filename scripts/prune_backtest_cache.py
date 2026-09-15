@@ -9,8 +9,9 @@ Builds a fresh, small DB and swaps files rather than DELETE+VACUUM in place --
 avoids both a slow NOT-IN scan across 167M rows and a slow VACUUM rewrite of a
 65GB file. The original stays untouched until the final swap step.
 
-Backup already exists (cron: cache/research/trading_universe_daily.db.bak,
-refreshed daily 2am) -- confirmed same day before running this.
+Backup already exists (cron: cache/research/trading_universe_daily.db.bak.gz,
+gzip-compressed since 2026-09-14, refreshed daily 2am) -- confirmed same day
+before running this.
 
 Usage:
   .venv/bin/python scripts/prune_backtest_cache.py --dry-run    (report only)

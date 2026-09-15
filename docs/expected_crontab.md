@@ -9,7 +9,7 @@ Update this file in the same commit as any `crontab -e` change (add/remove/edit 
 ```cron
 0 * * * * cp /home/pkim/git/trading/cache/live/trading_live.db /home/pkim/git/trading/output/live_backups/trading_live_$(date +\%Y\%m\%d_\%H).db.bak && ls -t /home/pkim/git/trading/output/live_backups/*.db.bak | tail -n +721 | xargs rm -f
 5 * * * * cp /home/pkim/git/trading/cache/live/trading_live.db /mnt/c/Users/pjkim/Documents/trading_backups/trading_live_$(date +\%Y\%m\%d_\%H).db.bak && ls -t /mnt/c/Users/pjkim/Documents/trading_backups/*.db.bak | tail -n +721 | xargs rm -f
-0 2 * * * cp /home/pkim/git/trading/cache/research/trading_universe.db /home/pkim/git/trading/cache/research/trading_universe_daily.db.bak
+0 2 * * * gzip -c /home/pkim/git/trading/cache/research/trading_universe.db > /home/pkim/git/trading/cache/research/trading_universe_daily.db.bak.gz
 30 6 * * * /home/pkim/git/trading/scripts/run_data_collector.sh >> /home/pkim/git/trading/logs/data_collector_daily.log 2>&1
 15 4 * * * /home/pkim/git/trading/.venv/bin/python3 /home/pkim/git/trading/db_cache.py >> /home/pkim/git/trading/logs/db_cache_daily.log 2>&1
 0 10 * * 1-5 /home/pkim/git/trading/.venv/bin/python3 /home/pkim/git/trading/scripts/collect_options_snapshot.py --tickers AGQ DFEN DPST HIBL JNUG KORU LABU NUGT SOXL UGL WEBL --option-type calls --expirations 2 >> /home/pkim/git/trading/logs/options_snapshot_daily.log 2>&1
