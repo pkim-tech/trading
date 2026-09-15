@@ -89,11 +89,27 @@ BUILD_LABEL = "as of 2026-08-29"  # vintage label for this build -- bump the dat
 
 def build_ticker(ticker):
     raw_path = SECOND_DIR / f"{ticker}_1s.csv"
-    if not raw_path.exists():
+    gz_path = SECOND_DIR / f"{ticker}_1s.csv.gz"
+    meta_path = SECOND_DIR / f"{ticker}_1s.meta.json"
+    if raw_path.exists():
+        raw_pulled_at = pd.Timestamp(os.path.getmtime(raw_path), unit="s").strftime("%Y-%m-%d %H:%M:%S")
+    elif gz_path.exists():
+        raw_path = gz_path
+        # scripts/compress_raw_second_csvs.py's sidecar is authoritative for
+        # raw_pulled_at -- the .gz file's own mtime is NOT trusted (compression
+        # resets it to compression time, which would silently corrupt the
+        # residual-dividend-adjustment logic below that depends on the REAL
+        # original pull date).
+        if not meta_path.exists():
+            print(f"{ticker}: {gz_path.name} exists but no sidecar meta.json -- "
+                  f"refusing to guess raw_pulled_at from a compressed file's mtime, skipping")
+            return False
+        import json
+        meta = json.loads(meta_path.read_text())
+        raw_pulled_at = meta["raw_pulled_at"]
+    else:
         print(f"{ticker}: no cached 1s data, skipping")
         return False
-
-    raw_pulled_at = pd.Timestamp(os.path.getmtime(raw_path), unit="s").strftime("%Y-%m-%d %H:%M:%S")
 
     # Chunked, per-chunk-session-pre-filtered read (2026-09-06, memory-safety fix
     # -- a single-shot pd.read_csv on SOXL's real 2.6GB raw file repeatedly OOM-
@@ -178,7 +194,9 @@ def main():
         sys.exit(1)
 
     if args.all:
-        tickers = sorted(Path(f).stem.replace("_1s", "") for f in glob.glob(str(SECOND_DIR / "*_1s.csv")))
+        csv_tickers = {Path(f).stem.replace("_1s", "") for f in glob.glob(str(SECOND_DIR / "*_1s.csv"))}
+        gz_tickers = {Path(f).stem.replace("_1s.csv", "") for f in glob.glob(str(SECOND_DIR / "*_1s.csv.gz"))}
+        tickers = sorted(csv_tickers | gz_tickers)
     elif args.tickers:
         tickers = args.tickers
     else:

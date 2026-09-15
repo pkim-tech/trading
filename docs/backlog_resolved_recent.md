@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [data][tooling] Resolved 2026-09-14 — raw 1s CSVs (cache/research/second_data/*_1s.csv) gzip-compressed with metadata sidecar + build/promote script support: 7.6GB->1.1GB, byte-identical verified for all 22 tickers. Full detail: `deep_backlog.md`.
+
 ## [tooling][data] Resolved 2026-09-14 — Task #3 (trades_cache.db split) closed: DROP+VACUUM of cliff_addon_cache/backtest_phase1/2_insurance from trading_universe.db run in `research` session after user go-ahead, both blocked earlier by classifier; paired review clean. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-09-13 — Phase4/Phase5 consolidation never ported trade-level persistence; write step added to `gt_full_review_rows`, delete-non-winners cleanup script built (not yet run), 14 promoted + 11 superseded v6.5.2 candidates backfilled into `phase5_trades`/`phase5_drought_windows`. Full detail: `deep_backlog.md`.
