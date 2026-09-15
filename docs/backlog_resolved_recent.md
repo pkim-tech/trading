@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [live-trading][tooling] Resolved 2026-09-14 — AGQ/GDXU/UGL/JNUG/ETHU/WEBL relabeled to v6.5.2 in place: confirmed byte-identical config to prior live node, no promotion/position-disruption needed, all 14 real live nodes now on v6.5.2. Full detail: `deep_backlog.md`.
+
+## [data][tooling] Resolved 2026-09-14 — real ~27GB freed across cache/research/ tonight: second_data raw CSVs (7.6GB->1.1GB), trades_cache.db pruned to v6.5.2-only (8.2GB->3.47GB), nightly trading_universe_daily.db.bak now gzip'd (5.24GB->511MB), permanent_archive/ compressed (9.19GB->1.88GB), watchlist_sweep.db retired (7.6GB->1.1GB archive, stale since 2026-07-07, both consumers confirmed dead). Full detail: `deep_backlog.md`.
+
 ## [data][tooling] Resolved 2026-09-14 — raw 1s CSVs (cache/research/second_data/*_1s.csv) gzip-compressed with metadata sidecar + build/promote script support: 7.6GB->1.1GB, byte-identical verified for all 22 tickers. Full detail: `deep_backlog.md`.
 
 ## [tooling][data] Resolved 2026-09-14 — Task #3 (trades_cache.db split) closed: DROP+VACUUM of cliff_addon_cache/backtest_phase1/2_insurance from trading_universe.db run in `research` session after user go-ahead, both blocked earlier by classifier; paired review clean. Full detail: `deep_backlog.md`.

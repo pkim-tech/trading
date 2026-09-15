@@ -43,6 +43,9 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
+## [live-trading][tooling] Raised 2026-09-14 — daily-track/live-track paper nodes stale + real coverage gaps (6 of 17 live tickers have none)
+Only 8 of 17 real live tickers have any paper/daily-track node; the 8 that exist are frozen at old (v5-era) config, several generations behind their current live counterpart -- plausibly explains real `daily_track_reconciliation_log` `ambiguous_position` flags. Real scoping simplification found: fix doesn't need to resolve old missing backtest data (some existing paper configs have zero backing rows anywhere), just needs each daily-track node refreshed to mirror its live counterpart's *current* config going forward. Paper-only, no capital at risk. Full detail: `deep_backlog.md`.
+
 ## [data][tooling] Raised 2026-09-14 — no split-residual adjustment for second-resolution tick data (dividends have one, splits don't)
 `build_massive_second_derived.py` trusts Massive's own per-pull baked-in dividend adjustment and applies a residual top-up only for ex-dividend dates after `raw_pulled_at` (2026-09-06 fix). No equivalent exists for splits at all — confirmed via grep, zero split-handling code in this file. If a split lands after a ticker's raw pull, second-data's historical basis would be silently wrong with no top-up mechanism to catch it, unlike the dividend case. Surfaced while reviewing the raw-CSV compression work (see the resolved item above) — not itself part of that fix, pre-existing gap. Not scoped, not started.
 
