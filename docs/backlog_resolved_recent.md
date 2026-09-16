@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][HIGH] Resolved 2026-09-15 — duplicate-order guard's `_broker_confirms_order` had no time bound, permanently blocking DFEN's market-sell exit fallback all day (real unprotected position); fixed via `since_ts` clock-skew-bounded window, paired-reviewed (cold+contextual Opus, both independently caught an insufficient first fix attempt), 1718/1727 tests pass (9 pre-existing/flaky, confirmed unrelated). DFEN's actual position still open/unprotected pending user's game-time call tomorrow morning -- see `backlog_cache.md`. Full detail: `deep_backlog.md`.
+
 ## [live-trading][tooling] Resolved 2026-09-14 — AGQ/GDXU/UGL/JNUG/ETHU/WEBL relabeled to v6.5.2 in place: confirmed byte-identical config to prior live node, no promotion/position-disruption needed, all 14 real live nodes now on v6.5.2. Full detail: `deep_backlog.md`.
 
 ## [data][tooling] Resolved 2026-09-14 — real ~27GB freed across cache/research/ tonight: second_data raw CSVs (7.6GB->1.1GB), trades_cache.db pruned to v6.5.2-only (8.2GB->3.47GB), nightly trading_universe_daily.db.bak now gzip'd (5.24GB->511MB), permanent_archive/ compressed (9.19GB->1.88GB), watchlist_sweep.db retired (7.6GB->1.1GB archive, stale since 2026-07-07, both consumers confirmed dead). Full detail: `deep_backlog.md`.

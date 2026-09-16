@@ -43,6 +43,9 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
+## [live-trading][HIGH] Raised 2026-09-15 — DFEN (roth, wl_id=255, 140 shares) still open with zero stop-loss protection overnight; user making a game-time call tomorrow morning
+Root cause fixed (duplicate-order guard's missing time bound, see `deep_backlog.md`'s 2026-09-15 entry), but DFEN's actual real position is untouched by the code fix -- market closed before it could retry. `trading_incidents` #18. Resolve or reconcile once the user decides tomorrow.
+
 ## [live-trading][execution][HIGH] Raised 2026-09-14 — sell_exceeds_position_blocked gates on stale LOCAL shares not real broker shares; fix attempt by coder4 rejected by paired review (2 HIGH findings), still open, real design work needed
 Full trace, rejected-fix writeup, and both review verdicts: `deep_backlog.md`.
 

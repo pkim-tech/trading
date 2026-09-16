@@ -1994,14 +1994,14 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
                 current_price = None
             if current_price is not None and current_price <= stop_price:
                 try:
-                    _, market_order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price,
-                                                                           node_dry_run=(node.get('state') != 'live'),
-                                                                           node_id=node.get('id'))
-                except schwab_safety.SafetyViolation:
+                    _, market_order_id = schwab_client.place_equity_sell(
+                        account, ticker, shares, current_price,
+                        node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
+                except schwab_safety.SafetyViolation as e3:
                     db.log_coverage_event(
                         "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                         node_id=node.get('id'), result="blocked_on_retry",
-                        detail="already protected by a resting order", source=source)
+                        detail=str(e3), source=source)
                     return
                 except Exception as e2:
                     last_error = e2
@@ -2049,11 +2049,11 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
                 _, sl_order_id = schwab_client.place_stop_loss(account, ticker, shares, stop_price,
                                                          node_dry_run=(node.get('state') != 'live'),
                                                          node_id=node.get('id'))
-            except schwab_safety.SafetyViolation:
+            except schwab_safety.SafetyViolation as e3:
                 db.log_coverage_event(
                     "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                     node_id=node.get('id'), result="blocked_on_retry",
-                    detail="already protected by a resting order", source=source)
+                    detail=str(e3), source=source)
                 return
             except Exception as e2:
                 last_error = e2

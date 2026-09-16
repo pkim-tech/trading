@@ -1313,7 +1313,7 @@ def _has_open_buy_order_for_ticker(orders: list, ticker: str, exclude_order_id: 
 
 
 def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int,
-                            exclude_order_id: int | None = None) -> bool:
+                            exclude_order_id: int | None = None, since_ts: float | None = None) -> bool:
     """True if the real order book (all statuses, see _all_orders) has an
     order for this exact (ticker, side, quantity within tolerance) that the
     broker genuinely accepted -- i.e. not CANCELED/EXPIRED/REJECTED/REPLACED.
@@ -1330,12 +1330,43 @@ def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int,
     swapped out. A genuinely separate confirming order still correctly blocks
     (the fingerprint loop itself isn't skipped); only a fingerprint whose ONLY
     broker-side match is the replace's own target falls through to the
-    allowed_retry branch instead of being wrongly treated as confirmed."""
+    allowed_retry branch instead of being wrongly treated as confirmed.
+    since_ts (2026-09-15, real DFEN incident): epoch seconds of the local
+    'recent_orders' candidate this call is confirming. _all_orders() returns
+    Schwab's FULL order history (get_orders_for_account has no date-range
+    filter here, confirmed live: ~60 days back), and this function previously
+    had no time bound at all, so a ticker/account/side/quantity combination
+    that has ever legitimately FILLED before (e.g. the same node's own SL
+    from days earlier, well within the 5% quantity tolerance) permanently
+    "confirmed" every future duplicate-window candidate for that fingerprint,
+    regardless of whether anything from the CURRENT attempt actually reached
+    the broker -- confirmed live against the real DFEN incident: 5 old FILLED
+    DFEN SELLs (2026-08-26 through 2026-09-11) matched today's fingerprint,
+    permanently blocking the market-sell fallback all day. Mirrors the
+    clock-skew-bounded pattern schwab_client already uses for its own
+    duplicate-retry detection (_find_recent_matching_order/
+    _RETRY_CLOCK_SKEW_BUFFER_SECS) -- a broker order entered before the local
+    candidate's own timestamp (minus a small skew buffer) cannot be that
+    candidate's real broker-side counterpart, no matter how well it
+    fingerprint-matches. None (the default) skips this check entirely,
+    preserving old behavior for any other caller."""
+    import schwab_client  # local import: schwab_client imports this module at load time
+    cutoff = None if since_ts is None else since_ts - schwab_client._RETRY_CLOCK_SKEW_BUFFER_SECS
     for o in orders:
         if exclude_order_id is not None and o.get("orderId") == exclude_order_id:
             continue
         if o.get("status") in _DUPLICATE_NOT_CONFIRMED_STATUSES:
             continue
+        if cutoff is not None:
+            entered_dt = schwab_client._parse_broker_timestamp(o.get("enteredTime"))
+            # Missing/unparseable enteredTime is NOT treated as "too old" --
+            # fail toward the old, safer, unbounded-confirm behavior (still
+            # counts as a candidate) rather than toward allowing a retry we
+            # can't actually confirm is safe. Real Schwab order payloads
+            # always carry enteredTime (confirmed live); this only matters
+            # for degraded data or a test fixture that omits it.
+            if entered_dt is not None and entered_dt.timestamp() < cutoff:
+                continue
         for leg in o.get("orderLegCollection", []):
             if leg.get("instruction") != side or leg.get("instrument", {}).get("symbol") != ticker:
                 continue
@@ -2283,7 +2314,8 @@ def check_order(
         # (automation_principles.md #1). Dry-run accounts have no broker book
         # to check against, so keep the pure local-record behavior.
         if limits.trading_enabled and not _broker_confirms_order(_all_orders(account), ticker, side, quantity,
-                                                                    exclude_order_id=replacing_order_id):
+                                                                    exclude_order_id=replacing_order_id,
+                                                                    since_ts=o["ts"]):
             signals_db.log_coverage_event(
                 "dup_order_retry_after_failure", _mode, ticker=ticker, node_id=_node_id, result="allowed_retry",
                 detail=f"side={side} qty={quantity}", source=source)
