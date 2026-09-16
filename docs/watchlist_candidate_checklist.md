@@ -406,6 +406,29 @@ matched `candidate_nodes.trades` exactly; CAGR cross-checked against `phase4_res
 cagr_pct` where available (all within ~1-6pp, consistent with years-window rounding,
 not a resim bug).
 
+## 20. Live daily-close-depth check (REQUIRED ACTION, do this at the moment of live promotion)
+Confirm at least `window` *days* (not hours -- `window` is a day-count, see
+`strategies.generate_daily_indicators`'s `df['Close'].rolling(window=w)`) of daily-close
+history is available for the ticker before flipping the node live. The real SMA/Std the
+daemon compares the live price against is computed from **daily closes**, not the
+`_1h.csv` hourly cache directly -- and the live path (`signals_compute._daily_close_source`)
+prefers a **fresh yfinance daily-close fetch** each poll, falling back to
+`cache/research/{ticker}_1h.csv` resampled to daily (`df.resample('D').last()`) only when
+that fresh fetch fails or returns fewer than `window` rows. So the practical risk from a
+short/gapped `_1h.csv` cache is narrower than it first looks: it only bites if the live
+daily fetch *also* has a problem that day, at which point a too-short fallback could
+produce an insufficient rolling window (fewer than `window` days), a degraded/missing
+SMA-Std, or an outright compute failure. Found 2026-09-16, investigating a re-opened
+`trading_incidents` ticket about under-cached hourly tickers (215, later 59, then 26 with
+a real gap) -- initially mis-stated this as a direct hourly-cache dependency before
+checking the actual code path; corrected same session. None of the 26-ticker gap found
+that night were live-traded. Quick check: confirm `window`+ days of daily closes are
+resolvable either via a live yfinance fetch or the `_1h.csv` fallback (whichever the
+fresh-fetch preference would actually use that day) -- cross-reference
+`scripts/check_stock_splits.py`'s split-detection (check 6) while here, since a missed
+split can look like enough days while actually containing a corrupted price jump inside
+the window.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds
