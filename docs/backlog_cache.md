@@ -46,6 +46,9 @@
 ## [live-trading][HIGH] Raised 2026-09-15 — DFEN (roth, wl_id=255, 140 shares) still open with zero stop-loss protection overnight; user making a game-time call tomorrow morning
 Root cause fixed (duplicate-order guard's missing time bound, see `deep_backlog.md`'s 2026-09-15 entry), but DFEN's actual real position is untouched by the code fix -- market closed before it could retry. `trading_incidents` #18. Resolve or reconcile once the user decides tomorrow.
 
+## [data] Raised 2026-09-16 — 26 tickers with a real hourly-cache backfill gap (cache starts ~2025-06-27, real yfinance history goes back further, e.g. COLO to 2009, NVDU/NVDX to 2023)
+Residual from closing `trading_incidents` #4 (was 215 tickers, now 26 -- the rest were genuinely newly-listed, not a gap). Full ticker list and per-ticker real-start-date check: `deep_backlog.md`. Zero overlap with any live-traded ticker -- exploratory/universe scope only, low priority.
+
 ## [live-trading][execution][HIGH] Raised 2026-09-14 — sell_exceeds_position_blocked gates on stale LOCAL shares not real broker shares; fix attempt by coder4 rejected by paired review (2 HIGH findings), still open, real design work needed
 Full trace, rejected-fix writeup, and both review verdicts: `deep_backlog.md`.
 

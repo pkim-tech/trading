@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [data][tooling] Resolved 2026-09-16 — trading_incidents #4 (215 under-cached tickers, stale data_collector process) closed: stale-code confirmed fixed, under-cache shrank to 59 (33 genuinely new listings, 26 real gap re-filed separately), zero overlap with live tickers. Full detail: `deep_backlog.md`.
+
+## [backtest] Resolved-as-stale 2026-09-16 — trading_incidents #5 (LABU node 172 trade-count mismatch) closed without root cause: original archived report gone, node long superseded by v6.5.2. Full detail: `deep_backlog.md`.
+
 ## [live-trading][HIGH] Resolved 2026-09-15 — duplicate-order guard's `_broker_confirms_order` had no time bound, permanently blocking DFEN's market-sell exit fallback all day (real unprotected position); fixed via `since_ts` clock-skew-bounded window, paired-reviewed (cold+contextual Opus, both independently caught an insufficient first fix attempt), 1718/1727 tests pass (9 pre-existing/flaky, confirmed unrelated). DFEN's actual position still open/unprotected pending user's game-time call tomorrow morning -- see `backlog_cache.md`. Full detail: `deep_backlog.md`.
 
 ## [live-trading][tooling] Resolved 2026-09-14 — AGQ/GDXU/UGL/JNUG/ETHU/WEBL relabeled to v6.5.2 in place: confirmed byte-identical config to prior live node, no promotion/position-disruption needed, all 14 real live nodes now on v6.5.2. Full detail: `deep_backlog.md`.
