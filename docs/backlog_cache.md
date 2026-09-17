@@ -43,8 +43,8 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [live-trading][HIGH] Raised 2026-09-15 — DFEN (roth, wl_id=255, 140 shares) still open with zero stop-loss protection overnight; user making a game-time call tomorrow morning
-Root cause fixed (duplicate-order guard's missing time bound, see `deep_backlog.md`'s 2026-09-15 entry), but DFEN's actual real position is untouched by the code fix -- market closed before it could retry. `trading_incidents` #18. Resolve or reconcile once the user decides tomorrow.
+## [live-trading][coverage][HIGH] Found 2026-09-16 (DFEN incident #18 follow-up) — manually-placed exit fills never auto-reconcile; repeated rejections never escalate; alert severity gap FIXED 2026-09-17
+Full detail: `deep_backlog.md`.
 
 ## [data] Raised 2026-09-16 — 26 tickers with a real hourly-cache backfill gap (cache starts ~2025-06-27, real yfinance history goes back further, e.g. COLO to 2009, NVDU/NVDX to 2023)
 Residual from closing `trading_incidents` #4 (was 215 tickers, now 26 -- the rest were genuinely newly-listed, not a gap). Full ticker list and per-ticker real-start-date check: `deep_backlog.md`. Zero overlap with any live-traded ticker -- exploratory/universe scope only, low priority.

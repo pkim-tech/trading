@@ -1095,7 +1095,7 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
 
 
 
-def _alert_reconcile_mismatch(pos, kind, text):
+def _alert_reconcile_mismatch(pos, kind, text, node=None):
     """Posts a reconciliation mismatch alert, rate-limited per (position,
     mismatch-kind) so an already-alerted, still-unresolved mismatch doesn't
     repost every poll cycle (same pattern as active_signals._guarded's
@@ -1106,6 +1106,17 @@ def _alert_reconcile_mismatch(pos, kind, text):
     daily/all-time counts aren't inflated by a condition someone already
     explained. Time-bounded by design: the snooze expires and resumes
     alerting rather than silencing the scenario forever.
+
+    node (2026-09-17): gates the Slack POST ONLY on should_alert_live(node),
+    same convention as every routine buy/sell alert -- coverage_events stays
+    unconditional (nothing is silently lost, only real-time paging). Found
+    same night: unlike routine alerts, this function had no capital-at-stake
+    gate at all, so a stray $50 research-state test node (GDXU, wl_id=108)
+    posted at the identical cadence/severity as a real ~$7,700 roth
+    UNPROTECTED alert (DFEN incident #18) in the same channel, making the
+    real incident harder to notice. node defaults to None (falls back to
+    always-post) for any caller that can't cheaply resolve one -- so a
+    missing node fails open (alerts) rather than silently going dark.
 
     Returns True if this was a real (non-snoozed) mismatch -- used by
     check_live_state_reconciliation to feed the node-level circuit breaker's
@@ -1122,7 +1133,8 @@ def _alert_reconcile_mismatch(pos, kind, text):
     )
     if not _throttled(_RECONCILE_ALERTED, f"{pos['id']}:{kind}", _RECONCILE_COOLDOWN_SECS):
         return True
-    _post_message(text, node_id=pos.get('wl_id'), incident=True, pos=pos)
+    if node is None or should_alert_live(node):
+        _post_message(text, node_id=pos.get('wl_id'), incident=True, pos=pos)
     return True
 
 
@@ -1657,7 +1669,8 @@ def check_live_state_reconciliation(open_positions, now=None):
                     f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: `open_positions` tracks "
                     f"{expected_shares:g} shares, broker shows {real_shares:g} — broker is ground "
                     f"truth; suggested fix: verify no unexpected fill/manual trade explains the gap, "
-                    f"then correct `open_positions.shares` to {real_shares:g}"
+                    f"then correct `open_positions.shares` to {real_shares:g}",
+                    node=_node,
                 )
 
         state = pos.get('trail_state') or {}
@@ -1716,14 +1729,16 @@ def check_live_state_reconciliation(open_positions, now=None):
                 f"but no trailing-sell order was ever confirmed placed — "
                 f"{'a resting SELL order was found (likely the original stop-loss, still intact)' if has_sell_order else 'NO resting SELL order was found at all'}; "
                 f"suggested fix: check the broker directly and either manually place a trailing-sell "
-                f"for {expected_shares:g} shares or confirm the existing resting order is adequate"
+                f"for {expected_shares:g} shares or confirm the existing resting order is adequate",
+                node=_node,
             )
         elif state.get('trailing') and state.get('order_placed') and not has_sell_order:
             mismatch_found |= _alert_reconcile_mismatch(
                 pos, "missing_trailing_sell",
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: trailing-sell marked placed but "
                 f"no resting SELL order found at the broker — position may be unprotected; "
-                f"suggested fix: place a trailing-sell order for {expected_shares:g} shares now"
+                f"suggested fix: place a trailing-sell order for {expected_shares:g} shares now",
+                node=_node,
             )
         elif state.get('trailing') and state.get('order_placed') and has_sell_order:
             # Part 8 quantity check (MEDIUM finding #3, paired Opus review
@@ -1755,14 +1770,16 @@ def check_live_state_reconciliation(open_positions, now=None):
                             f"leg={_merge_leg_check.get('shares', 0):g}, leg_id={_merge_leg_check['id']}) — "
                             f"{'add-on leg shares may be ORPHANED/unprotected' if float(_real_qty) < _merged_expected else 'OVERSELL RISK: the order would sell more than is held'}; "
                             f"suggested fix: verify the add-on leg's real shares at the broker, then "
-                            f"cancel and re-place the trailing-sell for {_merged_expected:g} shares"
+                            f"cancel and re-place the trailing-sell for {_merged_expected:g} shares",
+                            node=_node,
                         )
         elif not state.get('trailing') and pos.get('sl_order_id') and not has_sell_order:
             mismatch_found |= _alert_reconcile_mismatch(
                 pos, "missing_sl",
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: SL order id {pos['sl_order_id']} "
                 f"is recorded but no resting SELL order found at the broker — position may be "
-                f"unprotected; suggested fix: place a stop-loss order for {expected_shares:g} shares now"
+                f"unprotected; suggested fix: place a stop-loss order for {expected_shares:g} shares now",
+                node=_node,
             )
         elif (not state.get('trailing') and not pos.get('sl_order_id')
                 and not has_sell_order and _past_sl_grace(pos, now)):
@@ -1808,7 +1825,8 @@ def check_live_state_reconciliation(open_positions, now=None):
                 f"(open since {pos.get('entry_time')}, {expected_shares:g} shares; suggested fix: place a "
                 f"stop-loss SELL for {expected_shares:g} shares"
                 f"{f' at ~${_never_had_sl_price:.2f}' if _never_had_sl_price is not None else ''} now, "
-                f"or confirm the position was already exited)"
+                f"or confirm the position was already exited)",
+                node=_node,
             )
         if has_sell_order and not state.get('trailing') and pos.get('sl_order_id'):
             # Stage C, 2026-08-15: until now "a SELL order is resting" was the
@@ -1835,7 +1853,8 @@ def check_live_state_reconciliation(open_positions, now=None):
                         f"${float(_real_price):.4f} but the algo's own stop for this position is "
                         f"${_expected_price:.4f} — the broker order does not protect where the algo "
                         f"thinks it does; suggested fix: verify whether this stop was placed/edited "
-                        f"manually, then re-place it at ${_expected_price:.4f} if not deliberate"
+                        f"manually, then re-place it at ${_expected_price:.4f} if not deliberate",
+                        node=_node,
                     )
                 # core_shares, NOT expected_shares -- see core_shares' own
                 # comment above. The core stop covers the core leg only; an
@@ -1849,7 +1868,8 @@ def check_live_state_reconciliation(open_positions, now=None):
                         f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: resting stop covers "
                         f"{float(_real_qty):g} shares but the core position holds {core_shares:g} — "
                         f"{'partially unprotected' if float(_real_qty) < float(core_shares) else 'OVERSELL RISK: the stop would sell more than is held'}"
-                        f"; suggested fix: cancel and re-place the stop for {core_shares:g} shares"
+                        f"; suggested fix: cancel and re-place the stop for {core_shares:g} shares",
+                        node=_node,
                     )
         schwab_safety.record_node_streak(
             ticker, account, "reconciliation_mismatches", hit=mismatch_found, node_id=_node_id)
