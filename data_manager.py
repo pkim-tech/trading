@@ -17,6 +17,26 @@ CACHE_DIR = Path("./cache/research")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _atomic_to_csv(df, cache_path):
+    """Write via a same-dir temp file + os.replace so a concurrent reader (e.g.
+    signals_compute._load_cache, running in the Bolt handler thread) never sees
+    a partially-written file. Plain to_csv(cache_path) writes in place, so a
+    reader racing the write mid-file gets a torn read -- previously harmless
+    (every _load_cache call re-read fresh, self-healing next call), but became
+    a real bug once _load_cache started caching per (ticker, mtime): a torn
+    read gets cached under the post-write mtime and served to every caller
+    until the next real mtime change, instead of self-correcting immediately.
+
+    Temp path includes this process's pid: the live daemon and cron's
+    06:30-daily `data_collector.py --once` run both call this against the same
+    ticker CSVs, and a shared fixed temp filename would let one process's
+    partial write get replaced INTO by the other's os.replace, installing an
+    interleaved file as the real cache (found by contextual review, 2026-09-17)."""
+    tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+    df.to_csv(tmp_path)
+    os.replace(tmp_path, cache_path)
+
+
 def _apply_split_artifact_fix(ticker, df):
     """Shared by both the bootstrap (Step 1) and incremental (Step 3) paths
     -- see signals_helpers.fix_one_bar_split_artifacts's docstring for the
@@ -101,7 +121,7 @@ def fetch_live_data_smart(ticker):
             # only ever runs once per ticker.
             df_new = _apply_split_artifact_fix(ticker, df_new)
 
-            df_new.to_csv(cache_path)
+            _atomic_to_csv(df_new, cache_path)
             print(f"💾 Initial 2-year history cached for {ticker}.")
             
             df_daily = df_new.resample('D').last().dropna()
@@ -248,7 +268,7 @@ def fetch_live_data_smart(ticker):
 
         # 6. Save to disk cleanly
         df_combined.index.name = "Datetime"
-        df_combined.to_csv(cache_path)
+        _atomic_to_csv(df_combined, cache_path)
         print(f"💾 Cache structurally updated and written to disk for {ticker}.")
         
         df_daily = df_combined.resample('D').last().dropna()

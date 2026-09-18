@@ -51,6 +51,13 @@ def _mode_tag_for(account, node_id):
     return mode_tag(account, node)
 
 _client = None
+_client_lock = threading.Lock()  # guards the lazy-init check-then-act below (2026-09-17,
+# added once active_signals.py's housekeeping tail started firing 14-17 jobs
+# concurrently via ThreadPoolExecutor -- without this, two threads racing the
+# first-ever call could both see _client is None and each construct their own
+# schwab.auth.Client, including a concurrent authlib token-file read/refresh/
+# write; a torn token file write would take live trading down for every
+# account. Found by independent-cold review, 2026-09-17.
 _account_hashes = None  # nickname -> Schwab's encrypted account hash, resolved lazily
 
 
@@ -67,8 +74,10 @@ _CLIENT_TIMEOUT_SECS = 10.0
 def _get_client(interactive: bool = False):
     global _client
     if _client is None:
-        _client = schwab_auth.get_client(interactive=interactive)
-        _client.set_timeout(_CLIENT_TIMEOUT_SECS)
+        with _client_lock:
+            if _client is None:  # re-check: another thread may have won the race while we waited
+                _client = schwab_auth.get_client(interactive=interactive)
+                _client.set_timeout(_CLIENT_TIMEOUT_SECS)
     return _client
 
 

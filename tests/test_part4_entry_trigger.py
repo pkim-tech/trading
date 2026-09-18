@@ -6,7 +6,7 @@ Mirrors tests/test_part3_gap_resize.py's isolated-DB, monkeypatched-client
 style: no real Schwab API calls (dry_run stays True), no real Slack posts."""
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -90,23 +90,29 @@ def _pending():
 # ---------------------------------------------------------------------------
 
 def test_seconds_until_next_pinned_target_before():
+    # 2026-09-17: wake-scheduling now fires _HOUSEKEEPING_LEAD_SECS (15s) ahead
+    # of a pinned target too (docs/plans/tick_to_trade_latency_design.md
+    # section D's pre-window housekeeping trigger), not just at the target
+    # itself -- 10:30:02 - 15s = 10:29:47, expected relative to 9:25:00 now.
     now = datetime(2026, 7, 15, 9, 25, 0)
     secs = active_signals._seconds_until_next_pinned_target(now)
-    assert secs == pytest.approx(5 * 60 + 2, abs=1)
+    assert secs == pytest.approx(5 * 60 + 2 - active_signals._HOUSEKEEPING_LEAD_SECS, abs=1)
 
 
 def test_seconds_until_next_pinned_target_after_last_rolls_to_tomorrow():
     now = datetime(2026, 7, 15, 15, 45, 0)
     secs = active_signals._seconds_until_next_pinned_target(now)
-    # next day's 9:30:02
-    expected = (datetime(2026, 7, 16, 9, 30, 2) - now).total_seconds()
+    # next day's 9:30:02, lead-adjusted the same as every intraday target
+    expected = (datetime(2026, 7, 16, 9, 30, 2)
+                - timedelta(seconds=active_signals._HOUSEKEEPING_LEAD_SECS) - now).total_seconds()
     assert secs == pytest.approx(expected, abs=1)
 
 
 def test_seconds_until_next_pinned_target_mid_targets():
     now = datetime(2026, 7, 15, 10, 30, 5)  # just past 10:30:02
     secs = active_signals._seconds_until_next_pinned_target(now)
-    expected = (datetime(2026, 7, 15, 11, 30, 2) - now).total_seconds()
+    expected = (datetime(2026, 7, 15, 11, 30, 2)
+                - timedelta(seconds=active_signals._HOUSEKEEPING_LEAD_SECS) - now).total_seconds()
     assert secs == pytest.approx(expected, abs=1)
 
 

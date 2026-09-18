@@ -60,7 +60,7 @@ import threading
 import contextlib
 import fcntl
 import functools
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait as _futures_wait
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -98,7 +98,7 @@ from signals_db import (
 )
 from signals_compute import (
     _load_cache, _current_price, _hurst_adf, compute_buy_signal, _bars_held,
-    check_sell_condition, _indicator_cache,
+    check_sell_condition, _indicator_cache, _live_tick_price,
 )
 from signals_charts import _upload_chart, _chart_buy, _chart_sell
 from signals_blocks import (
@@ -160,9 +160,16 @@ _GAP_CHECK_WINDOW = (9, 15, 9, 29)
 # 7 (Section 1b, open positions only).
 _PINNED_BAR_TIMES = [(9, 30, 2), (10, 30, 2), (11, 30, 2), (12, 30, 2), (13, 30, 2), (14, 30, 2), (15, 30, 2)]
 _PINNED_ENTRY_TIMES = {(9, 30), (10, 30), (14, 30), (15, 30)}
-# The two moments where the backtest's literal bar Open is what's being matched
-# (vs. 10:30/15:30, which approximate the just-closed bar's Close).
-_PINNED_OPEN_TIMES = {(9, 30), (14, 30)}
+# The one moment where the backtest's literal bar Open is what's being matched
+# (vs. 10:30/14:30/15:30, which approximate the just-closed bar's Close).
+# 14:30 was removed 2026-09-17: schwab_client.get_session_open_price returns
+# quote["openPrice"] -- the fixed 9:30 session-open print -- which is only a
+# genuine "current price" proxy AT 9:30. Calling it at 14:30 returned a stale
+# value up to 5 hours old (confirmed live: identical logged prices at 9:30 and
+# 14:30 for the same ticker/day in open_price_quality_log, and a mean 1.811%
+# drift vs. the real recorded bar over the prior week). 14:30 now takes the
+# same get_current_price() live-quote path as 10:30/15:30.
+_PINNED_OPEN_TIMES = {(9, 30)}
 
 # Reference report fires once at each of these times daily -- early (7am) so
 # there's a report before the day even starts, before the open, and before the
@@ -302,17 +309,31 @@ def _ambient_buy_scan_nodes(watchlist, now):
     ]
 
 
+_HOUSEKEEPING_LEAD_SECS = 15  # how far ahead of a pinned target the housekeeping tail pre-fires
+
+
 def _seconds_until_next_pinned_target(now):
-    """Seconds until the next _PINNED_BAR_TIMES moment (today or, if today's are
-    all past, tomorrow's first) -- lets the main loop wake early right before a
-    pinned target instead of free-running past it on POLL_SECS cadence."""
-    todays = [now.replace(hour=h, minute=m, second=s, microsecond=0) for h, m, s in _PINNED_BAR_TIMES]
-    upcoming = [t for t in todays if t > now]
-    if upcoming:
-        target = min(upcoming)
-    else:
-        h, m, s = _PINNED_BAR_TIMES[0]
-        target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=s, microsecond=0)
+    """Seconds until the next wake target -- either a _PINNED_BAR_TIMES moment
+    itself, or _HOUSEKEEPING_LEAD_SECS before one (today's, or if all of
+    today's are past, tomorrow's first) -- lets the main loop wake early
+    instead of free-running past a target on POLL_SECS cadence. The
+    lead-secs-early wake is what lets run_loop's pre-window housekeeping
+    trigger (housekeeping_pre_window_alerted) actually fire before the pinned
+    target it's meant to precede, not just get noticed late alongside it."""
+    candidates = []
+    for h, m, s in _PINNED_BAR_TIMES:
+        base = now.replace(hour=h, minute=m, second=s, microsecond=0)
+        candidates.append(base)
+        candidates.append(base - timedelta(seconds=_HOUSEKEEPING_LEAD_SECS))
+    # Tomorrow's first target (+ its own pre-window variant) too -- not just a
+    # bare fallback -- so the day-boundary rollover gets the same early-wake
+    # treatment as every intraday transition, instead of only firing exactly
+    # AT that first target with no housekeeping lead time ahead of it.
+    h0, m0, s0 = _PINNED_BAR_TIMES[0]
+    tomorrow_base = (now + timedelta(days=1)).replace(hour=h0, minute=m0, second=s0, microsecond=0)
+    candidates.append(tomorrow_base)
+    candidates.append(tomorrow_base - timedelta(seconds=_HOUSEKEEPING_LEAD_SECS))
+    target = min(t for t in candidates if t > now)
     return (target - now).total_seconds()
 
 
@@ -359,6 +380,18 @@ def _real_order_or_position_exists(node, ticker):
         return False
 
 
+def _fmt_price(sig):
+    """Safe '%.4f'-style formatting for sig['current_price'] in a log_poll
+    line -- several tests (e.g. test_same_bar_reentry_cooldown.py) monkeypatch
+    compute_buy_signal with a minimal test-double dict that deliberately omits
+    current_price (it's irrelevant to what they're testing), and a bare
+    sig['current_price'] bracket-access in a NEW trace line would KeyError on
+    those (found by the full test suite, 2026-09-18, after log_poll tracing
+    was added to this function)."""
+    cp = sig.get('current_price')
+    return f"{cp:.4f}" if cp is not None else "n/a"
+
+
 def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=None):
     """Runs compute_buy_signal over `nodes` and fires notify_buy_signal on new BUYs.
     Shared by the open-check/close-window ambient polls and the pinned single-shot
@@ -366,7 +399,64 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
     handling -- price_overrides (ticker -> price) lets the pinned path substitute a
     precise fetched price for the default ambient yfinance lookup inside
     compute_buy_signal."""
-    price_overrides = price_overrides or {}
+    price_overrides = dict(price_overrides or {})
+    _caller_override_tickers = set(price_overrides)  # for price_source logging below
+    _prefetch_ts = {}  # ticker -> time.time() this batch prefetch completed, for the
+                        # staleness re-check right before order placement further down
+    # Parallel price pre-fetch (2026-09-17, docs/plans/tick_to_trade_latency_
+    # design.md section E) -- ambient/open_check callers pass no
+    # price_overrides at all, so compute_buy_signal would otherwise fetch
+    # each node's live tick (_live_tick_price, a real yfinance call) one at a
+    # time inside the sequential loop below. Pre-fetching concurrently for
+    # every ticker not already covered gives the ambient path the same class
+    # of speedup the pinned path already gets from _scan_pinned_entry's own
+    # parallel fetch, WITHOUT touching the sequential decision/dedup/order-
+    # placement logic below -- each node still gets its own compute_buy_signal
+    # call, in the same order, just fed a pre-fetched price instead of
+    # fetching it inline. daily_sync nodes are excluded from the fetch
+    # entirely (not just from using the result) -- they ignore any
+    # price_override unconditionally (see compute_buy_signal's daily_sync
+    # branch), so fetching for them would be a real network call for nothing.
+    # A fetch failure for a ticker simply leaves it OUT of price_overrides --
+    # that node's own compute_buy_signal call falls through to ITS normal
+    # _live_tick_price call (with the real cached-Close fallback), rather than
+    # this prefetch silently injecting a bad price.
+    #
+    # Gated on `not cfg.SIM_MODE` (independent-cold review, 2026-09-17): several
+    # offline tests patch compute_buy_signal directly but never patched
+    # _live_tick_price, so this prefetch -- which calls it BEFORE the (mocked)
+    # compute_buy_signal ever runs -- was making real yfinance calls (real 404s)
+    # during the test suite. SIM_MODE defaults on for any non-daemon invocation
+    # (signals_config.py), so this matches the project's existing "never hit a
+    # real external API from a test/sim context" convention rather than
+    # patching every affected test individually.
+    _tickers_to_fetch = sorted({
+        n['ticker'] for n in nodes
+        if n['ticker'] not in price_overrides and n.get('paper_role') != 'daily_sync'
+    }) if not cfg.SIM_MODE else []
+    if _tickers_to_fetch:
+        _t0 = time.time()
+        with ThreadPoolExecutor(max_workers=min(16, len(_tickers_to_fetch))) as _pool:
+            _fetched = dict(zip(_tickers_to_fetch,
+                                 _pool.map(lambda t: _live_tick_price(t, None), _tickers_to_fetch)))
+        _fetch_done_at = time.time()
+        for _t, _p in _fetched.items():
+            if _p is not None:
+                price_overrides[_t] = _p
+                _prefetch_ts[_t] = _fetch_done_at
+        _ok = sum(1 for v in _fetched.values() if v is not None)
+        # Explicit warning line (not just a stat), separate from the routine
+        # summary below -- a materially-below-100% fetch rate means multiple
+        # nodes are about to silently fall back to a cached hourly Close for
+        # their entry decision, the exact failure family behind tonight's
+        # 14:30 incident (independent-cold review finding C, 2026-09-17).
+        if _ok < len(_tickers_to_fetch):
+            log_poll(f"⚠️ ambient_prefetch DEGRADED: only {_ok}/{len(_tickers_to_fetch)} "
+                     f"tickers got a live price -- the rest fall back to compute_buy_signal's "
+                     f"own cached-Close path this poll")
+        log_poll(f"ambient_prefetch tickers={len(_tickers_to_fetch)} ok={_ok} "
+                 f"elapsed={_fetch_done_at - _t0:.2f}s prices={ {k: round(v, 4) for k, v in _fetched.items() if v is not None} }")
+
     # Pending (order placed but not yet confirmed filled) tickers, real and
     # paper -- the same-day unlock below must not re-fire while one of these
     # is still resting, or it would re-notify (and, if wired to automated
@@ -381,9 +471,50 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
     summaries = []
     for node in nodes:
         sig = compute_buy_signal(node, price_override=price_overrides.get(node['ticker']))
+        # Real price source, not just "was a dict key present" (independent-
+        # cold review, 2026-09-17: the old version logged BOTH a pinned Schwab
+        # price and this function's own ambient yfinance prefetch as identical
+        # "override", and logged a daily_sync node as "override" even though
+        # compute_buy_signal's daily_sync branch ignores price_override
+        # entirely and always uses the cached hourly bar Close). This ordering
+        # matches compute_buy_signal's own if/elif precedence exactly.
+        if node.get('paper_role') == 'daily_sync':
+            _price_source = 'daily_sync_bar'
+        elif node['ticker'] in _caller_override_tickers:
+            _price_source = 'pinned_schwab'
+        elif node['ticker'] in price_overrides:
+            _price_source = 'ambient_prefetch'
+        else:
+            _price_source = 'inline_live_tick'
+        # Replay context (independent-cold + contextual review, 2026-09-17):
+        # ticker/z-score/price alone aren't enough for a GT-sim replay to
+        # recompute what THIS node should have done -- it also needs which
+        # strategy/window/z-threshold produced the signal and which
+        # account/state this node actually is, without a separate DB join.
+        _replay_ctx = (f"strategy={node.get('strategy')} window={node.get('window')} "
+                       f"z_thresh={node.get('z_score_threshold', 2.0)} "
+                       f"account={node.get('account')} state={node.get('state')} "
+                       f"entry_timing={node.get('entry_timing')} price_source={_price_source}")
         if sig is None:
             summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
+            log_poll(f"{node['ticker']} node={node['id']} entry_decision=NO_DATA {_replay_ctx} "
+                     f"price_override={price_overrides.get(node['ticker'])}")
             continue
+
+        # Verbose per-decision-point trace (2026-09-17, at the user's explicit
+        # request after the 14:30 stale-price incident) -- every node's
+        # signal computation logs price/bands/z-score/bar here, BEFORE any
+        # dedup/gating logic runs, so a GT-sim replay of this exact moment can
+        # be checked against what the daemon actually saw and decided, not
+        # just against aggregate stats (the same class of gap that let the
+        # 14:30 bug hide undetected for a month -- see docs/plans/
+        # tick_to_trade_latency_design.md's root-cause section). This is
+        # deliberately unconditional (every node, every poll), not just on a
+        # BUY -- the interesting failure mode is often "why did this NOT
+        # fire," which needs the non-BUY case logged too.
+        log_poll(f"{node['ticker']} node={node['id']} entry_decision "
+                 f"price={sig.get('current_price')} lower_band={sig.get('lower_band')} "
+                 f"z={sig.get('z_score')} signal={sig['signal']} bar={sig.get('last_bar')} {_replay_ctx}")
 
         # Keyed on the watch_list row's own PK (wl_id), not (ticker, strategy, window) --
         # two concurrent nodes differing only in account/take_profit/label could otherwise
@@ -426,6 +557,8 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
         if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
             buy_alerted.add(alert_key)
             if already_held:
+                log_poll(f"{sig['ticker']} node={node['id']} entry_decision=SKIP_ALREADY_HELD "
+                         f"price={_fmt_price(sig)} z={sig['z_score']:+.2f} bar={sig['last_bar']}")
                 print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
                 # Real drought HANDOFF ordering fix (docs/plans/
                 # real_order_execution_drought_addon.md 0.6/5.4): in real mode,
@@ -537,6 +670,24 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                                       f"BUY signal suppressed — already pending/resting at broker or in pending_buys",
                                       node_id=node['id'])
                 else:
+                    # price_age surfaces a real, NOT-yet-fixed limitation
+                    # (contextual review, 2026-09-17): a batch-prefetched
+                    # ambient price is captured once, up front, for every node
+                    # in this poll -- a node late in this loop can now fire on
+                    # a price that's seconds older than it would have been
+                    # under the old per-node-fetch-at-its-own-turn behavior,
+                    # if an earlier-firing node's own notify_buy_signal call
+                    # blocked (real order placement + fill-confirm polling can
+                    # take up to ~10s). Logged here so this is visible/
+                    # auditable rather than silent; not auto-mitigated tonight
+                    # -- a real fix would re-fetch and re-validate the signal
+                    # immediately before firing when this value is large,
+                    # which is its own change deserving its own review.
+                    _price_age = time.time() - _prefetch_ts[sig['ticker']] if sig['ticker'] in _prefetch_ts else 0.0
+                    log_poll(f"{sig['ticker']} node={node['id']} entry_decision=FIRE_REAL "
+                             f"price={_fmt_price(sig)} z={sig['z_score']:+.2f} "
+                             f"bar={sig['last_bar']} account={node.get('account')} "
+                             f"price_source={_price_source} price_age={_price_age:.2f}s")
                     notify_buy_signal(node, sig)
             elif sig['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:
                 if paper_trading.start_paper_buy(node, sig):
@@ -547,8 +698,12 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                     print(f"  [cooldown] PAPER BUY {sig['ticker']} suppressed — signal bar "
                           f"not newer than last exit decision bar")
                 else:
+                    log_poll(f"{sig['ticker']} node={node['id']} entry_decision=FIRE_PAPER "
+                             f"price={_fmt_price(sig)} z={sig['z_score']:+.2f} bar={sig['last_bar']}")
                     print(f"  [paper] BUY: {node['ticker']} z={sig['z_score']:+.2f} (paper-trading)")
             else:
+                log_poll(f"{sig['ticker']} node={node['id']} entry_decision=RESEARCH_NO_ALERT "
+                         f"price={_fmt_price(sig)} z={sig['z_score']:+.2f} bar={sig['last_bar']}")
                 print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")
         else:
             mode_tag = ' [R]' if node.get('state') == 'paper' else ''
@@ -578,25 +733,42 @@ def _scan_pinned_entry(target_h, target_m, watchlist, buy_alerted, open_position
     if not nodes:
         return [], set()
     is_open_check = (target_h, target_m) in _PINNED_OPEN_TIMES
-    price_overrides = {}
-    failed_tickers = set()
-    for node in nodes:
-        ticker = node['ticker']
-        if ticker in price_overrides or ticker in failed_tickers:
-            continue
+
+    # Parallel fetch (2026-09-17, docs/plans/tick_to_trade_latency_design.md
+    # section E) -- real measured 7.5x speedup for 17 tickers (4.34s sequential
+    # -> 0.58s threaded), pure reads with no state mutation, so nothing here
+    # needs new locking. Each unique ticker fetched exactly once (mirrors the
+    # old loop's `if ticker in price_overrides: continue` dedup, just done
+    # up front instead of inline) regardless of how many nodes share it.
+    _tickers = sorted({n['ticker'] for n in nodes})
+
+    def _fetch_one(ticker):
         try:
             if is_open_check:
                 price, is_true_open = schwab_client.get_session_open_price(ticker)
             else:
                 price, is_true_open = schwab_client.get_current_price(ticker), False
+            return ticker, price, is_true_open, None
         except Exception as e:
-            print(f"  [pinned] {ticker} price fetch failed at {target_h:02d}:{target_m:02d}: {e}")
-            log_poll(f"{ticker} pinned_entry target={target_h:02d}:{target_m:02d} FETCH FAILED: {e}")
+            return ticker, None, None, e
+
+    price_overrides = {}
+    failed_tickers = set()
+    _t0 = time.time()
+    with ThreadPoolExecutor(max_workers=min(16, len(_tickers))) as _pool:
+        _results = list(_pool.map(_fetch_one, _tickers))
+    _elapsed = time.time() - _t0
+    for ticker, price, is_true_open, err in _results:
+        if err is not None:
+            print(f"  [pinned] {ticker} price fetch failed at {target_h:02d}:{target_m:02d}: {err}")
+            log_poll(f"{ticker} pinned_entry target={target_h:02d}:{target_m:02d} FETCH FAILED: {err}")
             failed_tickers.add(ticker)
             continue
         price_overrides[ticker] = price
         log_poll(f"{ticker} pinned_entry target={target_h:02d}:{target_m:02d} price={price:.4f} is_true_open={is_true_open}")
         db.log_open_price_quality(ticker, target_h, target_m, price, is_true_open)
+    log_poll(f"pinned_entry_fetch target={target_h:02d}:{target_m:02d} tickers={len(_tickers)} "
+             f"ok={len(price_overrides)} failed={len(failed_tickers)} elapsed={_elapsed:.2f}s")
     ready_nodes = [n for n in nodes if n['ticker'] not in failed_tickers]
     summaries = _scan_buy_signals(ready_nodes, buy_alerted, open_position_keys, price_overrides=price_overrides)
     return summaries, failed_tickers
@@ -652,6 +824,20 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
             # notify_sell_signal Slack flows for a synthetic position).
             continue
         if pos['ticker'] not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            continue
+        # Re-fetch fresh, skip if closed (2026-09-17) -- same reasoning as
+        # _check_position_exit's own re-fetch. This loop iterates the
+        # once-per-poll-cycle open_positions snapshot, which was previously
+        # safe to treat as current because nothing earlier in the SAME
+        # iteration could close a position before this ran. That's no longer
+        # true: the new pre-window housekeeping trigger (housekeeping_pre_
+        # window_alerted) can close this exact position via check_own_sell_
+        # fills/check_auto_fills seconds earlier in this same iteration.
+        # Without this re-fetch, a stale `pos` here could reach
+        # notify_sell_signal for an already-closed position (found by
+        # independent-cold review, 2026-09-17).
+        pos = db.get_position_by_id(pos['id'])
+        if pos is None:
             continue
         df_hourly, _ = _load_cache(pos['ticker'])
         if df_hourly is None or df_hourly.empty:
@@ -734,7 +920,19 @@ def _guarded(section: str, fn, *args, **kwargs):
     doesn't fail silently (#4), rate-limited per section (a persistent failure
     would otherwise repost every poll cycle). Returns fn's result, or None on
     failure -- callers that expect a list (e.g. summaries += _guarded(...))
-    must handle None."""
+    must handle None.
+
+    Section timing (2026-09-17): every _guarded call already funnels through
+    this one function, so it's the cheapest single place to get per-section
+    duration visibility into run_loop -- found live the same night that a
+    76s gap between two logged steps (dry_run_update_buys -> pinned_exit_arm)
+    was completely invisible, because none of the ~10 _guarded sections in
+    between (check_auto_fills, check_own_sell_fills, check_orphaned_broker_
+    positions, etc. -- several make real Schwab API calls) call log_poll
+    themselves. Logged via log_poll (verbose log only, same as every other
+    per-poll trace line) -- no threshold/alert here, this is purely
+    diagnostic visibility, not a new alerting decision."""
+    _t0 = time.time()
     try:
         return fn(*args, **kwargs)
     except Exception as e:
@@ -753,6 +951,91 @@ def _guarded(section: str, fn, *args, **kwargs):
             except Exception:
                 pass  # a Slack posting failure must not compound the original one
         return None
+    finally:
+        log_poll(f"section={section} elapsed={time.time() - _t0:.2f}s")
+
+
+def _run_housekeeping_tail(open_positions, last_seen_bar, paper_sell_alerted, dry_run_sell_alerted, now,
+                            timeout=None):
+    """Runs the daemon's DISCRETIONARY per-cycle housekeeping (broker
+    reconciliation, fill-detection, reminders, pending-buy bookkeeping)
+    concurrently instead of as a ~31s sequential block -- see docs/plans/
+    tick_to_trade_latency_design.md's cost model. None of these gate any order
+    decision made elsewhere in this same poll iteration.
+
+    timeout: max seconds this call blocks the caller waiting for jobs to
+    finish (None = wait for all, the default/regular-call behavior). A job
+    still running past timeout is NOT cancelled (Python threads can't be
+    killed) -- it keeps running in its own already-_guarded thread and simply
+    isn't waited on further by this call. Exists so the pre-window trigger
+    (run_loop) can't itself overrun into the pinned target it's meant to
+    finish ahead of.
+
+    Called from two places in run_loop: (1) its original unconditional
+    once-per-cycle position, unchanged, and (2) ~15s ahead of each pinned
+    bar-time target (housekeeping_pre_window_alerted) so the tail is freshly
+    complete by the time that window's own critical path (pinned-check ->
+    ambient scan) runs, instead of competing with it for the same thread.
+
+    Safe to run concurrently: WAL mode + busy_timeout (signals_db._conn,
+    2026-09-17) let concurrent writers queue instead of raising
+    "database is locked"; open_position()/close_position() already serialize
+    the one real double-close race via signals_db._position_lock (built for
+    the pre-existing poll-loop-vs-Bolt-handler-thread concurrency; extends
+    unchanged to these jobs as a 3rd concurrent caller).
+
+    Deliberately NOT included here: check_sl_order_fills/
+    check_live_state_reconciliation (safety-critical missing-protective-order/
+    auto-close detection -- stays sequential and first in run_loop, per design
+    doc section C) and sync_trade_control_channel (must run after every write
+    in the cycle completes so it reflects end-of-cycle state -- run_loop still
+    calls it sequentially, after this function returns)."""
+    jobs = [
+        ("paper_check_sells", paper_trading.check_paper_sells,
+         (last_seen_bar, paper_sell_alerted, _load_cache)),
+        ("dry_run_sim_check_sells", check_dry_run_sim_sells,
+         (last_seen_bar, dry_run_sell_alerted, _load_cache)),
+        ("intraday_risk_review", check_intraday_risk_review, ()),
+        ("addon_buying_power_drift", check_addon_buying_power_drift, ()),
+        ("orphaned_broker_positions", check_orphaned_broker_positions, ()),
+        ("auto_fills", check_auto_fills, (open_positions,)),
+        ("own_sell_fills", check_own_sell_fills, (open_positions,)),
+        ("addon_leg_reconciliation", check_addon_leg_reconciliation, (open_positions,)),
+        ("drain_fill_queue", drain_fill_queue, ()),
+        ("paper_update_buys", paper_trading.update_paper_buys, ()),
+        ("dry_run_update_buys", update_dry_run_buys, ()),
+        ("real_pending_buys_running_low", update_real_pending_buys_running_low, ()),
+        ("check_entry_abandon", check_entry_abandon, ()),
+        ("check_market_buy_rejected", check_market_buy_rejected, ()),
+    ]
+    if _reminders_active(now):
+        jobs += [
+            ("trailing_reminders", check_trailing_reminders, (open_positions,)),
+            ("exit_reminders", check_exit_reminders, (open_positions,)),
+            ("buy_reminders", check_buy_reminders, ()),
+        ]
+    # max_workers capped (not len(jobs)) -- an uncapped pool fires every
+    # Schwab-touching job in this batch simultaneously instead of spreading
+    # them at all, a real burst-risk flagged by independent-cold review
+    # (2026-09-17): near a pinned target this tail can already run twice
+    # close together (pre-window trigger + regular call, on a non-pinned-
+    # adjacent cycle) or from two different call sites; capping bounds how
+    # many concurrent Schwab calls any single invocation can make.
+    #
+    # No `with` block: `with ThreadPoolExecutor(...):` calls shutdown(wait=True)
+    # on exit, which blocks until every job finishes regardless of `timeout`
+    # below -- exactly the unbounded-join bug this timeout param exists to
+    # avoid (found by contextual review, 2026-09-17). shutdown(wait=False)
+    # returns immediately; any job still running past `timeout` keeps running
+    # in its own thread (already-isolated via _guarded) until it finishes on
+    # its own -- not waited on further by this call.
+    pool = ThreadPoolExecutor(max_workers=min(8, len(jobs)))
+    futures = [pool.submit(_guarded, name, fn, *args) for name, fn, args in jobs]
+    _done, not_done = _futures_wait(futures, timeout=timeout)
+    pool.shutdown(wait=False)
+    if not_done:
+        log_poll(f"housekeeping_tail: {len(not_done)}/{len(jobs)} job(s) still running "
+                 f"past {timeout}s timeout -- not waited on further this call")
 
 
 _RUN_LOCK_FH = None  # module-level so the fd (and its flock) survives for run_loop's whole life
@@ -971,6 +1254,13 @@ def run_loop(tickers: set = None):
         (last_date, h, m) for h, m, s in _PINNED_BAR_TIMES
         if (_now0.hour, _now0.minute) >= (h, m)
     }
+    # Same pre-seed/clear pattern as pinned_bar_alerted above, minute-granularity
+    # approximation of the real (target - _HOUSEKEEPING_LEAD_SECS) trigger --
+    # close enough to avoid a spurious catch-up fire on restart, same as that set.
+    housekeeping_pre_window_alerted: set[tuple] = {
+        (last_date, h, m) for h, m, s in _PINNED_BAR_TIMES
+        if (_now0.hour, _now0.minute) >= (h, m)
+    }
 
     while True:
         now   = datetime.now()
@@ -990,6 +1280,7 @@ def run_loop(tickers: set = None):
                 reference_alerted.clear()
                 gap_check_alerted.clear()
                 pinned_bar_alerted.clear()
+                housekeeping_pre_window_alerted.clear()
                 eod_report_alerted.clear()
                 last_date = today
 
@@ -1284,6 +1575,49 @@ def run_loop(tickers: set = None):
             # ability to masquerade as a real node's key.
             open_position_keys = _position_keys_by_book(open_positions, paper_positions)
 
+            # Pre-window housekeeping trigger (2026-09-17) -- fires once per
+            # pinned bar-time target, _HOUSEKEEPING_LEAD_SECS ahead of it (the
+            # wake-scheduling in _seconds_until_next_pinned_target already
+            # wakes the loop this early), so the discretionary housekeeping
+            # tail is freshly complete by the time the pinned-check block right
+            # below it runs, instead of competing with it for this thread.
+            #
+            # Window is bounded on BOTH ends (target_dt <= now < pinned_dt) --
+            # an earlier version fired unconditionally once now >= target_dt,
+            # which meant a late-arriving iteration (previous iteration
+            # overran, daemon restart mid-minute) fired the full batch AT OR
+            # AFTER the real pinned target, synchronously, immediately ahead of
+            # the pinned-check block below -- directly inverting the point of
+            # this change (found by contextual review, 2026-09-17). Past the
+            # pinned target, this trigger no-ops for that target and the
+            # tail's regular once-per-cycle call further down still covers it.
+            #
+            # timeout=... on the call below bounds how long this specific
+            # invocation can block the loop thread -- several of these jobs
+            # make real Schwab calls, so an unbounded join here could itself
+            # run past the pinned target it's trying to get ahead of. A timed-
+            # out job keeps running in its own thread (not killed, Python
+            # can't do that); it just isn't waited on further here.
+            #
+            # housekeeping_done_this_iter skips the tail's unconditional call
+            # later in this same iteration if it already ran here seconds ago
+            # -- without this, a poll landing inside the lead window fires the
+            # full ~14-17-job batch TWICE in the same iteration, seconds apart
+            # (not the intended ~15s-before-and-then-separately-on-schedule
+            # spacing), roughly doubling real Schwab call volume at exactly the
+            # 7 pinned moments/day (found by both paired reviewers, 2026-09-17).
+            housekeeping_done_this_iter = False
+            for ph, pm, ps in _PINNED_BAR_TIMES:
+                hkey = (today, ph, pm)
+                pinned_dt = now.replace(hour=ph, minute=pm, second=ps, microsecond=0)
+                target_dt = pinned_dt - timedelta(seconds=_HOUSEKEEPING_LEAD_SECS)
+                if target_dt <= now < pinned_dt and hkey not in housekeeping_pre_window_alerted:
+                    housekeeping_pre_window_alerted.add(hkey)
+                    _guarded("housekeeping_pre_window", _run_housekeeping_tail, open_positions,
+                             last_seen_bar, paper_sell_alerted, dry_run_sell_alerted, now,
+                             timeout=max(1, _HOUSEKEEPING_LEAD_SECS - 3))
+                    housekeeping_done_this_iter = True
+
             # Pinned single-shot checks (Part 4) -- fire once per hourly bar boundary,
             # ahead of/instead of relying purely on ambient POLL_SECS-cadence detection.
             for ph, pm, ps in _PINNED_BAR_TIMES:
@@ -1379,21 +1713,109 @@ def run_loop(tickers: set = None):
                             except Exception:
                                 pass  # a Slack posting failure must not crash the poll loop
 
+            # Moved here 2026-09-17 (was much later in the loop, just before
+            # drought ENTRY below) -- the AMBIENT buy scan (_ambient_buy_scan_
+            # nodes/_scan_buy_signals) is the fallback path for any signal the
+            # pinned entry-check block above missed or failed on (a real
+            # incident, ETHU, fired through exactly this ambient path). It used
+            # to sit behind ~31s of broker-housekeeping (paper/dry-run sells,
+            # reminders, auto-fills, own-sell-fills, addon-leg reconciliation,
+            # fill-queue drain, pending-buy updates, entry-abandon/market-buy-
+            # rejected checks) further down -- see docs/plans/
+            # tick_to_trade_latency_design.md section D. Moved to run
+            # immediately after the pinned block instead, ahead of that
+            # housekeeping. The drought-overlay HANDOFF block below (which
+            # MUST run before this poll's own core buy-signal scans, per its
+            # own docstring) moves with it, in the same relative order. The
+            # drought-overlay ENTRY block stays in its original position
+            # further down (it only needs to run AFTER the core buy-signal
+            # scans, which is still true now that they run earlier) --
+            # ambient_eligible_ids/open_position_keys computed here remain
+            # valid there since normal Python scoping, not loop position,
+            # governs when a value is visible.
+            in_window = _in_buy_window(now)
+            in_open_check_window = _in_window(now, _OPEN_CHECK_WINDOWS)
+
+            # 2026-08-09: drought-overlay HANDOFF -- MUST run BEFORE this poll's
+            # own core buy-signal scans below (paper_trading.
+            # check_paper_drought_handoff's own docstring states this ordering
+            # requirement explicitly; this is where it's actually enforced).
+            # Gated to the same real signal-check windows core's own entry scan
+            # uses -- compute_buy_signal itself has no window gating, so calling
+            # this unconditionally every poll could close a drought position on
+            # a signal that only transiently existed between real window checks
+            # (found by the independent Opus review during the paper-trading
+            # build, MEDIUM-9). Node-aware gate (only in_open_check_window for an
+            # open_check-timing node, matching which scan actually runs for it
+            # this poll) -- a paired review of the wiring itself found the
+            # original blanket `in_window or in_open_check_window` gate ran
+            # HANDOFF for a close-timing node during the 9:31-9:40/14:31-14:40
+            # open_check windows even though no core scan runs for that node
+            # then, closing a drought position with nothing behind it.
+            # open_position_keys is refreshed immediately after (not left stale)
+            # -- the same review found the scans below would otherwise still see
+            # a just-closed drought row as "already held" via the pre-handoff
+            # snapshot taken earlier in this iteration.
+            # Reuses _ambient_buy_scan_nodes' OWN real decision (not a
+            # re-derived approximation of it) for which nodes the ambient
+            # scan actually processes this exact poll -- an independent
+            # review found the first version's `in_window` branch above
+            # treated every node as eligible, missing that function's own
+            # :25-:29 pre-pinned exclusion for open_check+automation-enabled
+            # nodes. Reusing the real function directly means this can never
+            # drift from it the way a second hand-copied condition could.
+            ambient_eligible_ids = {n['id'] for n in _ambient_buy_scan_nodes(watchlist, now)} if in_window else set()
+            handoff_ran = False
+            for node in watchlist:
+                if not node.get('drought_overlay_enabled'):
+                    continue
+                node_in_window = ((in_window and node['id'] in ambient_eligible_ids)
+                                  or (in_open_check_window and node.get('entry_timing') == 'open_check'))
+                if node_in_window:
+                    _guarded(f"drought_handoff[{node['ticker']}]", paper_trading.check_paper_drought_handoff, node)
+                    # Real sibling, exact same site/gate, inverse mode --
+                    # no-ops for a research-mode node (docs/plans/
+                    # real_order_execution_drought_addon.md 5.5).
+                    _guarded(f"drought_handoff_real[{node['ticker']}]", check_drought_handoff, node)
+                    handoff_ran = True
+            if handoff_ran:
+                open_position_keys = _position_keys_by_book(
+                    get_open_positions(), get_open_positions(paper=True))
+
+            if in_open_check_window:
+                open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']
+                if open_check_nodes:
+                    summaries += _guarded(
+                        "scan_buy_open_check", _scan_buy_signals, open_check_nodes, buy_alerted, open_position_keys
+                    ) or []
+            if in_window:
+                summaries += _guarded(
+                    "scan_buy_signals", _scan_buy_signals, _ambient_buy_scan_nodes(watchlist, now),
+                    buy_alerted, open_position_keys
+                ) or []
+            elif not in_open_check_window:
+                windows = " or ".join(f"{h0:02d}:{m0:02d}" for h0, m0, _, _ in _SIGNAL_WINDOWS)
+                summaries.append(f"outside signal window — next: {windows} ET")
+
             def _check_position_exit(pos):
                 # Re-fetch fresh before check_sell_condition -- pos here is still
                 # the once-per-poll-cycle open_positions snapshot (top of this
                 # iteration), and check_sell_condition itself internally merges/
                 # persists trail_state, so calling it against a stale snapshot
                 # risks clobbering a real concurrent update (the Slack-handler-
-                # thread race the SH stuck-exit bug family is built from). Not
-                # practically reachable today -- this call always runs before any
-                # writer inside the same poll iteration touches this position,
-                # and the notify_sell_signal call further down already re-fetches
-                # its own fresh copy -- but closing it here removes the last
-                # instance of this pattern that relies on ordering instead of an
-                # explicit re-fetch (found in the 2026-07-31 audit's still-open
-                # list). A None return means the position was closed concurrently
-                # since the snapshot was taken -- nothing left to check.
+                # thread race the SH stuck-exit bug family is built from).
+                # Originally added defensively (found in the 2026-07-31 audit's
+                # still-open list) when this call always ran before any writer
+                # inside the same poll iteration touched this position -- that
+                # stopped being true 2026-09-17, when the new pre-window
+                # housekeeping trigger started running check_own_sell_fills/
+                # check_auto_fills earlier in this same iteration, so this
+                # re-fetch is now load-bearing, not just a hardening measure
+                # (see _scan_pinned_exit_arm's matching re-fetch, added same
+                # night once the earlier version of this comment was found
+                # stale by review). A None return means the position was closed
+                # concurrently since the snapshot was taken -- nothing left to
+                # check.
                 fresh_pos = db.get_position_by_id(pos['id'])
                 if fresh_pos is None:
                     return
@@ -1472,69 +1894,20 @@ def run_loop(tickers: set = None):
                     continue
                 _guarded(f"exit_check[{pos['ticker']}]", _check_position_exit, pos)
 
-            _guarded("paper_check_sells", paper_trading.check_paper_sells, last_seen_bar, paper_sell_alerted, _load_cache)
-            _guarded("dry_run_sim_check_sells", check_dry_run_sim_sells,
-                     last_seen_bar, dry_run_sell_alerted, _load_cache)
-
-            if _reminders_active(now):
-                _guarded("trailing_reminders", check_trailing_reminders, open_positions)
-                _guarded("exit_reminders", check_exit_reminders, open_positions)
-                _guarded("buy_reminders", check_buy_reminders)
-
-            # Called every cycle (POLL_SECS cadence, no interval throttle of
-            # its own -- deliberately, it's a cheap DB query) -- its own
-            # internal gating (trading day + 9:15-16:00 ET window) decides
-            # whether it actually does anything, same pattern as check_gap_resize.
-            _guarded("intraday_risk_review", check_intraday_risk_review)
-
-            # Called every cycle like the check above -- its own internal
-            # gating (trading day + once-per-day state watermark) decides
-            # whether it actually makes a real broker call. Added 2026-08-10
-            # as follow-up #1 of the add-on buying-power reservation fix
-            # (docs/deep_backlog.md's 2026-08-09/10 entry).
-            _guarded("addon_buying_power_drift", check_addon_buying_power_drift)
-
-            # Same "called every cycle, gates itself internally" pattern as the
-            # two checks above. Stage D of the 2026-08-14 SOXS incident fix:
-            # the ground-truth broker sweep already existed and already ran at
-            # 07:00 (see the readiness block above), but 07:00 is pre-market --
-            # a fill going unreconciled at 09:30 wasn't swept for until the
-            # NEXT morning. This adds an intraday cadence (30 min, 9:45-16:00)
-            # over the SAME run_full_sweep, so the gap is half an hour instead
-            # of ~22 hours. Detect-only, never auto-corrects.
-            _guarded("orphaned_broker_positions", check_orphaned_broker_positions)
-
-            # Not gated to market hours -- a GTC trailing order can fill any time it's
-            # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
-            # (schwab_safety.auto_fill_detection_enabled, off by default).
-            _guarded("auto_fills", check_auto_fills, open_positions)
-
-            # Unconditional (not opt-in, not gated to market hours) -- unlike
-            # check_auto_fills above, this only ever rechecks an order_id we placed
-            # ourselves, so there's no ambiguity to gate on: once Schwab confirms
-            # that exact order FILLED, close the position, no manual tap required.
-            _guarded("own_sell_fills", check_own_sell_fills, open_positions)
-
-            # Real add-on leg reconciliation (Part 6.4, docs/plans/
-            # real_order_execution_drought_addon.md) -- same unconditional
-            # cadence as check_own_sell_fills/check_auto_fills above, since a
-            # leg's entry order can go stale or its parent's lockstep close
-            # can be missed any time, not just inside a signal window.
-            _guarded("addon_leg_reconciliation", check_addon_leg_reconciliation, open_positions)
-
-            # Fast-path fill reconciliation (Part 3, branch C) -- cheap, non-blocking
-            # drain of whatever schwab_stream's account-activity websocket has queued
-            # since the last iteration. check_auto_fills above is the always-on
-            # fallback, so this is a latency improvement, not a new dependency.
-            _guarded("drain_fill_queue", drain_fill_queue)
-
-            # Same "not gated to a window" reasoning as check_auto_fills above -- a
-            # simulated trailing buy can bounce-fill any time after the signal fires.
-            _guarded("paper_update_buys", paper_trading.update_paper_buys)
-            _guarded("dry_run_update_buys", update_dry_run_buys)
-            _guarded("real_pending_buys_running_low", update_real_pending_buys_running_low)
-            _guarded("check_entry_abandon", check_entry_abandon)
-            _guarded("check_market_buy_rejected", check_market_buy_rejected)
+            # Discretionary housekeeping (broker reconciliation, fill-detection,
+            # reminders, pending-buy bookkeeping) -- runs concurrently via
+            # _run_housekeeping_tail (2026-09-17) instead of as a ~31s sequential
+            # block; see that function's docstring and docs/plans/
+            # tick_to_trade_latency_design.md. Also invoked ~15s ahead of each
+            # pinned bar-time target earlier in this same iteration (see
+            # housekeeping_pre_window_alerted above) -- skipped here if that
+            # already ran THIS iteration (housekeeping_done_this_iter), so a
+            # poll landing inside the lead window doesn't run the full batch
+            # twice seconds apart. A cycle that isn't near a pinned target
+            # still gets full coverage here, unchanged.
+            if not housekeeping_done_this_iter:
+                _run_housekeeping_tail(open_positions, last_seen_bar, paper_sell_alerted,
+                                        dry_run_sell_alerted, now)
 
             # Dedicated trade-control channel (2026-08-17). Deliberately last
             # and deliberately unconditional: every step above may have just
@@ -1578,69 +1951,12 @@ def run_loop(tickers: set = None):
                     continue
                 _guarded(f"limit_fill[{node['ticker']}]", _check_limit_fill, node)
 
-            in_window = _in_buy_window(now)
-            in_open_check_window = _in_window(now, _OPEN_CHECK_WINDOWS)
-
-            # 2026-08-09: drought-overlay HANDOFF -- MUST run BEFORE this poll's
-            # own core buy-signal scans below (paper_trading.
-            # check_paper_drought_handoff's own docstring states this ordering
-            # requirement explicitly; this is where it's actually enforced).
-            # Gated to the same real signal-check windows core's own entry scan
-            # uses -- compute_buy_signal itself has no window gating, so calling
-            # this unconditionally every poll could close a drought position on
-            # a signal that only transiently existed between real window checks
-            # (found by the independent Opus review during the paper-trading
-            # build, MEDIUM-9). Node-aware gate (only in_open_check_window for an
-            # open_check-timing node, matching which scan actually runs for it
-            # this poll) -- a paired review of the wiring itself found the
-            # original blanket `in_window or in_open_check_window` gate ran
-            # HANDOFF for a close-timing node during the 9:31-9:40/14:31-14:40
-            # open_check windows even though no core scan runs for that node
-            # then, closing a drought position with nothing behind it.
-            # open_position_keys is refreshed immediately after (not left stale)
-            # -- the same review found the scans below would otherwise still see
-            # a just-closed drought row as "already held" via the pre-handoff
-            # snapshot taken earlier in this iteration.
-            # Reuses _ambient_buy_scan_nodes' OWN real decision (not a
-            # re-derived approximation of it) for which nodes the ambient
-            # scan actually processes this exact poll -- an independent
-            # review found the first version's `in_window` branch above
-            # treated every node as eligible, missing that function's own
-            # :25-:29 pre-pinned exclusion for open_check+automation-enabled
-            # nodes. Reusing the real function directly means this can never
-            # drift from it the way a second hand-copied condition could.
-            ambient_eligible_ids = {n['id'] for n in _ambient_buy_scan_nodes(watchlist, now)} if in_window else set()
-            handoff_ran = False
-            for node in watchlist:
-                if not node.get('drought_overlay_enabled'):
-                    continue
-                node_in_window = ((in_window and node['id'] in ambient_eligible_ids)
-                                  or (in_open_check_window and node.get('entry_timing') == 'open_check'))
-                if node_in_window:
-                    _guarded(f"drought_handoff[{node['ticker']}]", paper_trading.check_paper_drought_handoff, node)
-                    # Real sibling, exact same site/gate, inverse mode --
-                    # no-ops for a research-mode node (docs/plans/
-                    # real_order_execution_drought_addon.md 5.5).
-                    _guarded(f"drought_handoff_real[{node['ticker']}]", check_drought_handoff, node)
-                    handoff_ran = True
-            if handoff_ran:
-                open_position_keys = _position_keys_by_book(
-                    get_open_positions(), get_open_positions(paper=True))
-
-            if in_open_check_window:
-                open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']
-                if open_check_nodes:
-                    summaries += _guarded(
-                        "scan_buy_open_check", _scan_buy_signals, open_check_nodes, buy_alerted, open_position_keys
-                    ) or []
-            if in_window:
-                summaries += _guarded(
-                    "scan_buy_signals", _scan_buy_signals, _ambient_buy_scan_nodes(watchlist, now),
-                    buy_alerted, open_position_keys
-                ) or []
-            elif not in_open_check_window:
-                windows = " or ".join(f"{h0:02d}:{m0:02d}" for h0, m0, _, _ in _SIGNAL_WINDOWS)
-                summaries.append(f"outside signal window — next: {windows} ET")
+            # in_window/in_open_check_window/HANDOFF/the ambient+open_check buy
+            # scans now run earlier in this function -- see the 2026-09-17
+            # comment right after the pinned entry-check block above. They no
+            # longer live here; ambient_eligible_ids and open_position_keys
+            # computed there are still valid by the time drought ENTRY below
+            # uses them.
 
             # drought-overlay ENTRY -- MUST run AFTER the core buy-signal scans
             # above (the opposite ordering from HANDOFF), so a core signal that

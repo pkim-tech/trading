@@ -35,14 +35,33 @@ from signals_blocks import _post_message
 # Price data
 # ---------------------------------------------------------------------------
 
+# ticker -> ((ticker, csv mtime), (df_hourly, df_daily)); one entry per ticker, the
+# stored (ticker, mtime) key is compared against the file's current mtime on each
+# call to decide whether to re-read. Old mtimes are overwritten, not accumulated --
+# do NOT change this to key the dict itself by (ticker, mtime), which would grow
+# unboundedly over a long-running daemon process. Avoids re-reading/re-parsing a
+# ticker's multi-year hourly CSV on every call (measured ~45-62ms/call, 36 calls/
+# cycle for 16 distinct tickers). Invalidated by real file mtime changes
+# (data_collector.py's background refresh appending new data), not a daily freeze --
+# see docs/plans/tick_to_trade_latency_design.md section A for why a daily-frozen-band
+# precompute was rejected in favor of this narrower, correctness-preserving cache.
+_load_cache_cache = {}
+
+
 def _load_cache(ticker):
     path = cfg.RESEARCH_DIR / f"{ticker}_1h.csv"
     if not path.exists():
         return None, None
+    mtime = path.stat().st_mtime
+    cache_key = (ticker, mtime)
+    cached = _load_cache_cache.get(ticker)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
     df = pd.read_csv(path, index_col=0, parse_dates=True)
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
     df_daily = df.resample('D').last().dropna()
+    _load_cache_cache[ticker] = (cache_key, (df, df_daily))
     return df, df_daily
 
 

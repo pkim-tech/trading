@@ -355,9 +355,33 @@ CASH_RESERVE_WATERMARK = 1_000
 
 # Global (all-accounts) burst cap, separate from each account's daily cap --
 # catches a runaway loop spamming orders within a single signal-check minute
-# before the daily cap would ever trip. Sized at 2x the 6-ticker live watchlist
-# (buy+sell per ticker in the same minute), not Schwab's own 120/min platform limit.
-GLOBAL_ORDERS_PER_MINUTE = 12
+# before the daily cap would ever trip. Resized 2026-09-17 (was 12, sized for
+# a 6-ticker live watchlist) as part of docs/plans/tick_to_trade_latency_
+# design.md section E: parallelizing the pinned-entry/ambient price-fetch
+# compresses what used to be a multi-minute spread-out fire into a period of
+# seconds, so the OLD cap could now reject/delay real orders during one real
+# simultaneous multi-ticker signal -- a self-inflicted version of the exact
+# latency problem this project is trying to fix.
+#
+# Real count checked directly against the DB, not assumed (corrected
+# 2026-09-17 after an earlier version of this comment cited the wrong
+# figure): 31 distinct tickers across BOTH state='live' (17) and
+# state='dry_run' (18, overlapping some live tickers) nodes -- dry_run nodes
+# still call approve_and_record, so they consume this same counter. Same "2x
+# ticker count, buy+sell in the same minute" methodology as the original
+# value: 31 * 2 = 62, rounded DOWN (not up) to 60.
+#
+# Rounded down deliberately, not for headroom margin against Schwab's 120/min
+# platform limit (independent-cold review, 2026-09-17): this cap is the ONLY
+# count-based backstop for SELL orders and for is_protective BUYs (both
+# bypass the per-account daily_order_cap, see check_order below) -- raising
+# it also raises how many real orders a runaway SELL/exit-side bug could
+# place before this catches it (12 -> 60 is a real 5x wider blast radius on
+# that side, not just more BUY-side capacity). Do not raise this further
+# without that tradeoff in mind; if the real ticker count grows meaningfully
+# beyond 31, re-derive from a real DB count the same way, don't just bump
+# toward Schwab's 120/min ceiling.
+GLOBAL_ORDERS_PER_MINUTE = 60
 
 
 def kill_switch_engaged() -> bool:

@@ -1481,6 +1481,13 @@ def check_live_state_reconciliation(open_positions, now=None):
     schwab_safety.check_order has -- this alerts, it doesn't refuse
     anything."""
     _accounts_down_this_cycle: set[str] = set()
+    # Per-account open-order-book cache for this call, 2026-09-17: _open_orders
+    # is account-scoped (the whole account's order book), not position-scoped,
+    # but positions cluster by account (one account can hold 5-6 open
+    # positions) -- without this, the identical order book got refetched once
+    # per position sharing that account, every poll cycle. get_real_position
+    # stays per-position/uncached below (genuinely ticker-specific).
+    _orders_cache: dict[str, list] = {}
     for pos in open_positions:
         if pos.get('is_dry_run_sim'):
             # No real order was ever placed for this position -- the broker has
@@ -1525,6 +1532,23 @@ def check_live_state_reconciliation(open_positions, now=None):
             # Already exhausted retries once for this account this cycle --
             # don't pay another 6s of sleep to reconfirm what's already known.
             last_exc = RuntimeError(f"account '{account}' already failed reconciliation fetch this cycle")
+        elif account in _orders_cache:
+            # Order book for this account was already fetched successfully by
+            # an earlier position sharing this account this cycle -- reuse it,
+            # only real_shares (ticker-specific) needs a fresh fetch/retry.
+            for attempt in range(1, _RECONCILE_FETCH_RETRIES + 1):
+                try:
+                    real_shares = schwab_client.get_real_position(account, ticker)
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    if attempt < _RECONCILE_FETCH_RETRIES:
+                        time.sleep(_RECONCILE_FETCH_RETRY_DELAY_SECS)
+            if last_exc is not None:
+                _accounts_down_this_cycle.add(account)
+            else:
+                orders = _orders_cache[account]
         else:
             for attempt in range(1, _RECONCILE_FETCH_RETRIES + 1):
                 try:
@@ -1538,6 +1562,8 @@ def check_live_state_reconciliation(open_positions, now=None):
                         time.sleep(_RECONCILE_FETCH_RETRY_DELAY_SECS)
             if last_exc is not None:
                 _accounts_down_this_cycle.add(account)
+            else:
+                _orders_cache[account] = orders
         if last_exc is not None:
             db.log_coverage_event(
                 "reconciliation_fetch_failed", _coverage_mode(account),

@@ -1165,6 +1165,211 @@ def _deep_parity_worker(ticker, wl_id, strategy, window, z_score_threshold, take
                 f"kernel {len(kt)}/replay {len(rt)} trades")
 
 
+TICK_TO_ACTION_FLAG_SECS = 30
+TICK_TO_ACTION_MATCH_WINDOW_SECS = 15 * 60
+# Every real outcome a tick can resolve to -- a BLOCK is just as much an "action" as a
+# placed order for this purpose (see tick_to_trade_report.py's identical list).
+TICK_TO_ACTION_SCENARIO_KEYS = (
+    "automated_buy_execution",
+    "buy_signal_window_block",
+    "daily_order_cap_block",
+    "global_burst_cap_block",
+    "same_day_block",
+    "hard_order_ceiling_block",
+)
+
+
+def _open_check_tick_to_action():
+    """Measures the delay from every entry_timing='open_check' tick today (the pinned
+    Open price fetch, open_price_quality_log) to whatever outcome followed it -- a
+    placed order OR any check_order SafetyViolation block -- not just price drift on
+    successful placements. Found 2026-09-17 diagnosing ETHU's missed 2026-09-15 14:30
+    entry (blocked, 573s after its own tick) and DPST/OILU/ERY/DFEN/HIBL/NUGT's
+    same-night near-misses (168-432s, still placed): the common thread across ALL of
+    these isn't price drift specifically, it's DELAY -- every tick that should trigger
+    an action deserves its delay measured, whether the action succeeded, drifted in
+    price, or got blocked outright. This generalizes the original price-drift-only
+    version of this check per the same-night discussion.
+
+    Bounded to open_check nodes -- open_price_quality_log is the only place a tick
+    timestamp is already logged without touching active_signals.py/signals_notify.py;
+    a `close`-timing node's ambient entry has no equivalent logged tick today, so this
+    can't yet cover every entry-triggering tick system-wide. Exit-side ticks (SL/ARM/
+    TP/TIME) are explicitly out of scope too (2026-09-17 call) -- a different shape
+    (no single pinned reference tick), not built here.
+
+    Scoped to TODAY only, matching this Part's other same-day sub-checks; a longer
+    lookback is scripts/tick_to_trade_report.py's job (same join, this is its daily
+    standing-report sibling). Read-only, no judgment on whether any given trade was
+    itself "wrong" -- just surfaces the delay so it's never invisible again."""
+    since_utc = f"{TODAY} 00:00:00"
+    quality_rows = db.get_open_price_quality_log(since=since_utc)
+    if not quality_rows:
+        return
+    outcomes = _get_coverage_events_since(TICK_TO_ACTION_SCENARIO_KEYS, since_utc)
+    by_ticker = {}
+    for o in outcomes:
+        by_ticker.setdefault(o["ticker"], []).append(o)
+
+    print(f"\n--- 4b. Tick-to-action delay, every open_check entry tick today ---")
+    # Reports EVERY live outcome in-window per tick, not a single "best match" --
+    # a ticker with 2+ concurrently active live nodes can legitimately produce 2+
+    # real, distinct outcomes off the same shared tick (open_price_quality_log
+    # logs one tick per ticker, not per node); picking a nearest winner would
+    # silently drop a real event. Same fix as tick_to_trade_report.py, 2026-09-17.
+    unmatched = 0
+    n_outcomes = 0
+    flagged = []
+    for q in quality_rows:
+        tick_dt = datetime.strptime(q["ts"], "%Y-%m-%d %H:%M:%S")
+        matches = []
+        for o in by_ticker.get(q["ticker"], []):
+            o_dt = datetime.strptime(o["ts"], "%Y-%m-%d %H:%M:%S")
+            delta = (o_dt - tick_dt).total_seconds()
+            if 0 <= delta <= TICK_TO_ACTION_MATCH_WINDOW_SECS:
+                matches.append((delta, o))
+        if not matches:
+            unmatched += 1
+            continue
+        for delta, o in matches:
+            n_outcomes += 1
+            if delta >= TICK_TO_ACTION_FLAG_SECS:
+                outcome_label = o["result"] if o["scenario_key"] == "automated_buy_execution" else f"BLOCKED:{o['scenario_key']}"
+                flagged.append((q, delta, outcome_label, o["node_id"]))
+
+    print(f"  {len(quality_rows)} pinned ticks today, {n_outcomes} real live outcome(s) matched, "
+          f"{unmatched} tick(s) unmatched (no BUY signal ever fired at/after that tick)")
+    if flagged:
+        for q, delta, outcome_label, node_id in sorted(flagged, key=lambda r: -r[1]):
+            print(f"  ⚠️  {q['ticker']:6s} target={q['target_h']:02d}:{q['target_m']:02d}  "
+                  f"delay={delta:.0f}s  outcome={outcome_label}  node_id={node_id}")
+        print(f"  {len(flagged)} of {n_outcomes} matched outcome(s) took >= {TICK_TO_ACTION_FLAG_SECS}s "
+              f"from tick to action")
+    else:
+        print(f"  all {n_outcomes} matched outcome(s) resolved in under {TICK_TO_ACTION_FLAG_SECS}s")
+
+
+NON_BLOCKING_RESULTS = ("skipped_margin_account",)
+
+
+def _get_coverage_events_since(scenario_keys, since):
+    """mode='live' only -- a ticker can carry several watch_list nodes at once
+    (dry_run/research/paper/live, different accounts/strategies); coverage_events
+    is per-node but open_price_quality_log's tick is logged per-TICKER only, so
+    without this filter a ticker-only join can silently match a dry_run/research
+    node's own unrelated activity instead of the real live outcome (found
+    2026-09-17: GDXU's join grabbed a research-state dry_run node's $129.04
+    'placed' instead of the actual live node's real outcome). Also excludes
+    NON_BLOCKING_RESULTS -- same_day_block's 'skipped_margin_account' is an
+    informational log, not a real block, and was matching ahead of the real
+    outcome a few seconds later."""
+    con = sqlite3.connect(LIVE_DB)
+    con.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in scenario_keys)
+    exclude_placeholders = ",".join("?" for _ in NON_BLOCKING_RESULTS)
+    rows = con.execute(
+        f"SELECT ts, ticker, scenario_key, result, detail, node_id FROM coverage_events "
+        f"WHERE scenario_key IN ({placeholders}) AND ts >= ? AND mode='live' "
+        f"AND result NOT IN ({exclude_placeholders}) ORDER BY ts",
+        (*scenario_keys, since, *NON_BLOCKING_RESULTS),
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+FILL_TO_SL_FLAG_SECS = 15
+FILL_TO_ADDON_MATCH_WINDOW_SECS = 24 * 60 * 60  # addon can legitimately fire hours after fill (arm-triggered), not a delay signal itself
+
+
+def _fill_to_sl_delay():
+    """Measures the delay from a real buy fill (buy_fill_reconciled) to that
+    position's stop-loss actually being placed at the broker (sl_placement) --
+    the position is genuinely UNPROTECTED for this whole gap. Raised 2026-09-17
+    alongside the tick-to-action work: 'when filled, need filled-to-SL measured'
+    -- a fill->SL delay is arguably higher-stakes than an entry-timing delay,
+    since it's real capital sitting with no resting protective order, not just
+    a signal that fired late. Joined by (ticker, nearest sl_placement after the
+    fill) rather than position_id -- buy_fill_reconciled logs node_id (wl_id),
+    sl_placement logs position_id (open_positions.id), two different id spaces;
+    a wl_id can only have one open position at a time so ticker+time-proximity
+    is unambiguous in practice. Scoped to TODAY, same convention as this Part's
+    other same-day sub-checks."""
+    since_utc = f"{TODAY} 00:00:00"
+    fills = _get_coverage_events_since(("buy_fill_reconciled",), since_utc)
+    sl_events = _get_coverage_events_since(("sl_placement",), since_utc)
+    by_ticker = {}
+    for s in sl_events:
+        by_ticker.setdefault(s["ticker"], []).append(s)
+
+    print(f"\n--- 4c. Fill-to-SL-placed delay, every real buy fill today ---")
+    if not fills:
+        print("  no real buy fills today")
+        return
+    unmatched = 0
+    flagged = []
+    for f in fills:
+        f_dt = datetime.strptime(f["ts"], "%Y-%m-%d %H:%M:%S")
+        best = None
+        for s in by_ticker.get(f["ticker"], []):
+            s_dt = datetime.strptime(s["ts"], "%Y-%m-%d %H:%M:%S")
+            delta = (s_dt - f_dt).total_seconds()
+            if 0 <= delta <= TICK_TO_ACTION_MATCH_WINDOW_SECS and (best is None or delta < best[0]):
+                best = (delta, s)
+        if best is None:
+            unmatched += 1
+            continue
+        delta, s = best
+        if delta >= FILL_TO_SL_FLAG_SECS:
+            flagged.append((f, delta))
+    matched = len(fills) - unmatched
+    print(f"  {len(fills)} real fill(s) today, {matched} matched to an SL placement, "
+          f"{unmatched} unmatched (no sl_placement event found -- worth checking directly, "
+          f"not just a slow-report artifact)")
+    if flagged:
+        for f, delta in sorted(flagged, key=lambda r: -r[1]):
+            print(f"  ⚠️  {f['ticker']:6s} fill@{f['ts']}  UNPROTECTED for {delta:.0f}s before SL placed")
+    elif matched:
+        print(f"  all {matched} matched fill(s) got their SL placed within {FILL_TO_SL_FLAG_SECS}s")
+
+
+def _fill_to_addon_delay():
+    """Measures the delay from a real buy fill to that position's first addon
+    leg placement (addon_entry_placement), for positions where an addon leg
+    actually fired. NOT flagged on a delay threshold the way fill-to-SL is --
+    an addon leg fires on its own arm/vol-gate condition, legitimately hours
+    after fill (see docs/CLAUDE.md's overlay design), so a long gap here is
+    normal, not a defect. Pure reporting, matching section 4's existing
+    'magnitude, pure reporting, no threshold' convention for the same reason.
+    Scoped to TODAY, same convention as this Part's other same-day sub-checks."""
+    since_utc = f"{TODAY} 00:00:00"
+    fills = _get_coverage_events_since(("buy_fill_reconciled",), since_utc)
+    addon_events = _get_coverage_events_since(("addon_entry_placement",), since_utc)
+    by_ticker = {}
+    for a in addon_events:
+        by_ticker.setdefault(a["ticker"], []).append(a)
+
+    print(f"\n--- 4d. Fill-to-addon delay, informational only (no defect threshold) ---")
+    if not fills or not addon_events:
+        print("  no addon leg placed today" if fills else "  no real buy fills today")
+        return
+    shown = 0
+    for f in fills:
+        f_dt = datetime.strptime(f["ts"], "%Y-%m-%d %H:%M:%S")
+        best = None
+        for a in by_ticker.get(f["ticker"], []):
+            a_dt = datetime.strptime(a["ts"], "%Y-%m-%d %H:%M:%S")
+            delta = (a_dt - f_dt).total_seconds()
+            if 0 <= delta <= FILL_TO_ADDON_MATCH_WINDOW_SECS and (best is None or delta < best[0]):
+                best = (delta, a)
+        if best is None:
+            continue
+        delta, a = best
+        shown += 1
+        print(f"  {f['ticker']:6s} fill@{f['ts']}  addon placed +{delta / 60:.1f}min later")
+    if not shown:
+        print("  no fill today had a matching addon leg placement")
+
+
 def _deep_live_parity():
     """Plan Part 3 sub-part 3 -- live CODE vs kernel, which is a different question from the
     outcome-vs-kernel check above: it replays active_signals.py's own compute_buy_signal/
@@ -1643,6 +1848,10 @@ def part3():
         print(f"  wl_id={wl_id:4d}  UNCHECKED -- {reason}")
     print(f"{active_count} node(s) had activity to compare, {quiet_count} confirmed quiet on BOTH "
           f"real and kernel sides (checked, not assumed)")
+
+    _open_check_tick_to_action()
+    _fill_to_sl_delay()
+    _fill_to_addon_delay()
 
     _deep_live_parity()
 

@@ -1,5 +1,6 @@
 """Small shared helpers with no cross-dependency on blocks/charts/handlers."""
 import json
+import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -364,13 +365,30 @@ def stop_status(pos):
     return 'manual', None
 
 
+_VERBOSE_LOG_MAX_BYTES = 200 * 1024 * 1024  # 200MB
+
+
 def log_poll(msg):
     """Appends one [poll] trace line to VERBOSE_LOG_PATH -- every price/bar a
     live-trading decision point actually used, kept out of the human-readable
     log so day-to-day monitoring isn't buried. Built 2026-07-22 after a real
     stale-cache bug (HIBL paper trade) went unnoticed with no way to see what
-    price/bar each poller had actually read at decision time."""
+    price/bar each poller had actually read at decision time.
+
+    Rotates at _VERBOSE_LOG_MAX_BYTES (2026-09-17) -- this file had grown to
+    711MB completely unrotated (found by independent-cold review the same
+    night active_signals.py started logging a per-node trace on every poll
+    for every node in the whole watchlist, ~88 nodes, meaningfully increasing
+    the write rate). Keeps exactly one rotated backup (.1); an unbounded
+    accumulation of numbered backups would just move the same disk-exhaustion
+    risk to a different file. The rename-then-append below isn't perfectly
+    atomic against another thread's concurrent open() (this project's poll
+    loop and Bolt handler thread can both call this), but the exception is
+    swallowed the same as any other failure here -- worst case on a genuine
+    race is one lost line or one extra rotation, never a crash."""
     try:
+        if os.path.exists(cfg.VERBOSE_LOG_PATH) and os.path.getsize(cfg.VERBOSE_LOG_PATH) > _VERBOSE_LOG_MAX_BYTES:
+            os.replace(cfg.VERBOSE_LOG_PATH, f"{cfg.VERBOSE_LOG_PATH}.1")
         with open(cfg.VERBOSE_LOG_PATH, "a") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [poll] {msg}\n")
     except Exception:

@@ -49,6 +49,26 @@ def _is_tax_advantaged_account(account: str) -> bool:
 def _conn():
     c = sqlite3.connect(cfg.DB_PATH)
     c.row_factory = sqlite3.Row
+    # WAL + busy_timeout: prerequisite for parallelizing active_signals.py's
+    # housekeeping tail (2026-09-17, docs/plans/tick_to_trade_latency_design.md)
+    # -- without this, two threads' connections writing at the same time hit
+    # sqlite3.OperationalError("database is locked") immediately instead of
+    # queuing. WAL also lets a writer and a reader (e.g. this poll's own
+    # SELECTs vs. the Bolt handler thread's) proceed without blocking each
+    # other at all. journal_mode is a per-DATABASE-FILE setting (persists
+    # after this connection closes) so this PRAGMA is a fast no-op once set;
+    # busy_timeout is per-CONNECTION and must be set every time.
+    #
+    # busy_timeout set FIRST (independent-cold review, 2026-09-17): the
+    # journal_mode=WAL statement itself is the one call here that can need an
+    # exclusive lock (the actual rollback-journal -> WAL conversion, or any
+    # re-conversion) -- with busy_timeout still at sqlite3's 0ms default at
+    # that point, a concurrent connection mid-conversion would raise
+    # "database is locked" out of _conn() itself, before this function ever
+    # gets a chance to set the real timeout. Same pattern already used in
+    # app.py/run_optimization_sweep.py for the research DB.
+    c.execute("PRAGMA busy_timeout=10000")
+    c.execute("PRAGMA journal_mode=WAL")
     return c
 
 

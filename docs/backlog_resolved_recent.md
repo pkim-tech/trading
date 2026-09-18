@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][execution][HIGH] Resolved 2026-09-17/18 — daemon loop reordered + parallelized (housekeeping tail, entry price-fetch); backup cron fixed for WAL; not yet verified against a real trading day. Full detail: `deep_backlog.md`.
+
 ## [data][tooling] Resolved 2026-09-16 — trading_incidents #4 (215 under-cached tickers, stale data_collector process) closed: stale-code confirmed fixed, under-cache shrank to 59 (33 genuinely new listings, 26 real gap re-filed separately), zero overlap with live tickers. Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved-as-stale 2026-09-16 — trading_incidents #5 (LABU node 172 trade-count mismatch) closed without root cause: original archived report gone, node long superseded by v6.5.2. Full detail: `deep_backlog.md`.

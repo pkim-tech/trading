@@ -15,6 +15,7 @@ new rows only ever extend the front of the history backward.
 Usage: .venv/bin/python scripts/backfill_hourly_history.py TICKER [TICKER ...] [--dry-run]
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -62,7 +63,14 @@ def backfill_one(ticker, dry_run=False):
           f"{len(df_local)} -> {len(df_combined)} total)")
 
     if not dry_run:
-        df_combined.to_csv(cache_path)
+        # Atomic (temp file + os.replace), not in-place -- this writes the same
+        # cache/research/{ticker}_1h.csv file signals_compute._load_cache reads and
+        # caches per mtime; an in-place write here can hand a concurrently-running
+        # live daemon a torn read that then gets cached and served until the next
+        # real mtime change, instead of self-healing on the daemon's next poll.
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        df_combined.to_csv(tmp_path)
+        os.replace(tmp_path, cache_path)
         print(f"{ticker}: wrote {cache_path}")
 
 
